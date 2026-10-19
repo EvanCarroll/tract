@@ -44,17 +44,18 @@ machine. Sizes in MiB. ms per token is the page's median over both sentences, wa
 | tract, `mode=tract` | 61.2 | 594 | 2.1 s | same |
 | tract, `&fold=1` | 30.8 | 594 | 2.8 s | same |
 | tract, `&fold=1&models=models-int8` | 37.8 | 367 | 2.3 s | **differs** ("gebrochen") |
-| tract, `&merged=1` | 60.6 | 482 | 2.2 s | same |
-| tract, `&merged=1&fold=1` | 28.3 | 482 | 2.7 s | same |
+| tract, `&merged=1` | 55.0 | 482 | 2.4 s | same |
+| tract, `&merged=1&fold=1` | **18.0** | 482 | 2.8 s | same |
 
 The `ort-noqdq` row was measured on 2026-10-18 with an earlier page that averaged all
-repetitions. The `merged` rows were measured on a loaded machine, back to back with
-`mode=ort` (22.3 ms/token, 382 MiB) and `&fold=1` (28.3 ms/token, 594 MiB): compare them with
-those, not with the rows above.
+repetitions. The `merged` rows were measured on a loaded machine (load average about 2), back
+to back with `mode=ort` (21.8 ms/token, 389 MiB): compare them with that, not with the rows
+above. They include `wasm_i32_4x1`, the int8 GEMV kernel; the same session without it gave
+28.3 ms/token folded, and a repeat with it 19.3.
 
 | Download | Baseline | tract |
 |---|---|---|
-| runtime (brotli / gzip / raw) | **2.11 / 3.31 / 12.90** | 2.62 / 4.24 / 15.22 |
+| runtime (brotli / gzip / raw) | **2.11 / 3.31 / 12.90** | 2.63 / 4.25 / 15.27 |
 | model | **101** (encoder 47 + merged decoder 54) | 101 with `&merged=1`; 151 split (decoders 104) |
 
 Parity means every tract cell at or below the bold baseline cell, with the same output.
@@ -143,13 +144,16 @@ The page prints each translation, then a JSON summary: load time, median ms per 
   "gebrochen"). The same model gives different words natively and in WASM, so an output check
   only counts in the browser.
 - A decode step's weight matmuls are all 8-bit (`DynamicQuantizeLinear` activations,
-  `MatMulInteger` weights, i32 accumulator) with **n = 1**: per layer, 6 with m = k = 512
-  (self-attention q/k/v/o, cross-attention q/o) and fc1/fc2 (512 × 2048), 36 in all
-  (`tract ... -O dump --audit-json` on the decoder with past). In WASM none of them gets a SIMD
-  kernel: `linalg/src/wasm/mod.rs` `preferred()` answers `None` for `(I32, Some(1))`, so the
-  generic tier picks `generic_i32_4x1`, scalar Rust. The only WASM int8 kernel is
-  `wasm_i32_4x4`, chosen for n > 1 (the encoder, the first step). f32 GEMV has
-  `wasm_f32_{4,8,16,32}x1` routed by M band.
+  `MatMulInteger` weights, i32 accumulator) with **n = 1** at run time: per layer, 6 with
+  m = k = 512 (self-attention q/k/v/o, cross-attention q/o) and fc1/fc2 (512 × 2048), 36 in all
+  (`tract ... -O dump --audit-json` on the decoder with past). Their n is
+  `batch_size × decoder_sequence_length`, symbolic, so `preferred()` never sees them:
+  `strategize` takes the packing-group route, where `retain_best` drops every generic kernel.
+  Until `wasm_i32_4x1` they all ran on `wasm_i32_4x4`, which at n = 1 costs 2.3× the scalar
+  `generic_i32_4x1`: about 12 ms of a 28 ms token. `wasm_i32_4x1` shares the 4x4's A packing,
+  so core pairs the two (`VecVsMat`) and the 4x1 takes every n = 1 call: 5.6-6.5× the 4x4 on
+  these shapes (`i32x4.dot_i16x8_s` on shuffled K pairs; the relaxed-simd dot is no faster
+  here). The page went 28.3 → 18.0 ms/token, same output.
 - Folded, the output projection is one f32 GEMV, m = 58101, k = 512: 30 M multiply-adds and
   117 MiB of weights streamed every token, more than the 36 int8 matmuls together (22 M, 22 MiB).
   It is probably memory-bound in WASM.
@@ -185,39 +189,32 @@ The page prints each translation, then a JSON summary: load time, median ms per 
 ## Plan to parity
 
 Where tract stands against the baseline, last measured 2026-10-19 (loaded machine, back to back):
-speed 28.3 vs 22.3 ms/token, peak heap 482 vs 382 MiB, runtime download 2.62 vs 2.11 MiB brotli,
-model download at parity (101 MiB, `&merged=1`), output the same.
+speed **18.0 vs 21.8 ms/token, ahead** in Chrome and level in Firefox (22.1 vs 21.9), peak heap 482 vs 389 MiB, runtime download 2.63 vs
+2.11 MiB brotli, model download at parity (101 MiB, `&merged=1`), output the same. Heap is the
+largest gap left; B attacks it.
 
 Each item says what it should buy; measure before and after with the rules above, and record
 the result in the tables.
 
-### Next iteration: the 8-bit decode matmuls (A) and the output projection (B)
+### Next iteration: the output projection (B)
 
-The largest lever on each remaining axis, both in the matmul layer. Do A first: it is self-contained
-in `linalg/src/wasm`, and B's kernel work builds on what it teaches. Both need an idle machine for
-the browser numbers; check before measuring, and redo the two `merged` rows of the targets table
-first so there is a clean "before".
+**A. A SIMD int8 GEMV kernel for WASM.** Done: `wasm_i32_4x1`, 28.3 → 18.0 ms/token, same
+output (see Speed). Left over:
+- A wider kernel (8x1, 16x1) would need a matrix kernel of the same A packing to pair with
+  under a symbolic n; the 4x4's packing is what fixes MR = 4 today.
+- Try `+relaxed-simd` in `build-wasm.sh` on the page: it no longer helps the int8 GEMV, but
+  fuses the f32 multiply-add of the folded output projection. Chrome has it; other browsers may
+  not, so it may mean a second build.
 
-**A. A SIMD int8 GEMV kernel for WASM.** Speed: every weight matmul of every decode step.
-1. Confirm the cost before writing code. Time `generic_i32_4x1` against `wasm_i32_4x4` at
-   m = 512, k = 512 and m = 2048, k = 512 / m = 512, k = 2048, n = 1, under wasmtime: extend
-   `linalg/benches/wasm.rs` (its header has the command; `wasmtime` and the `wasm32-wasip1`
-   target are installed). Also try the cheap variant: route `(I32, Some(1))` to
-   `wasm_i32_4x4` in `preferred()` and measure the page — if that alone moves ms/token, the
-   case is made.
-2. Write `wasm_i32_{8,16}x1` (or whatever MR the bench favours) in `linalg/src/wasm/mmm_i32.rs`,
-   on the model of `mmm_f32_gemv.rs` for the GEMV structure and `wasm_i32_4x4` for the
-   int8 multiply (widening i8→i16→i32 `extmul` under plain simd128; the relaxed-simd dot path
-   exists in `wasm_i32_4x4`). Keep the epilogue on the shared scalar quant path, as
-   `wasm_i32_4x4` does: integer accumulation is exact, so the kernel must be bit-identical to
-   the generic one, and the `frame/mmm` kernel tests check it (run them under wasmtime, see
-   `linalg/src/wasm/mod.rs` header).
-3. Route `(I32, Some(1))` to it by M band, as the f32 GEMV arm does, and update the
-   `preferred()` doc comment and `dispatch_tests.rs`.
-4. Measure: wasm bench, then the page (`&merged=1&fold=1`); output must stay identical.
-5. Separately, try `+relaxed-simd` in `build-wasm.sh` (int8 dot instruction, fused f32
-   multiply-add). Chrome has it; other browsers may not, so it may mean a second build. Record
-   the gain either way.
+Engines rank kernels differently. Under wasmtime 49 (Cranelift) `wasm_i32_4x1` is 3× the 4x4
+but 15-25% *behind* `generic_i32_4x1`; under Node (V8) it is 2.8-4.3× ahead of the generic, and
+on the page Firefox goes 33.5 → 22.1 ms/token (baseline 21.9) and Chrome 28.3 → 18.0. Run the
+kernel tests under wasmtime (header of `linalg/src/wasm/mod.rs`), but take speed decisions from
+V8 and the page: bench under Node with
+`CARGO_TARGET_WASM32_WASIP1_RUNNER="node --no-warnings wasi-run.mjs"`, where `wasi-run.mjs`
+instantiates the module with `node:wasi` (`version: 'preview1'`, `preopens: {'/': '/'}`) and
+passes its arguments through, and check Firefox (Playwright `playwright-firefox`) before
+calling a speed item done. `cargo bench` takes no `--release`.
 
 **B. Keep the output projection as uint8, dequantized inside the matmul.** Heap (−117 MiB of f32
 weight, and the fold's transient) and speed (4× less weight traffic per token). A matmul taking
@@ -240,7 +237,8 @@ them (`models-int8`) changed the output.
    closes item 5). The harness fold then has nothing large left to fold; check it no longer
    creates the 117 MiB tensor (`mem --merged --fold`, the `folded` stage).
 4. Its WASM panel extractor must keep the GEMV fast: one panel of 32 rows × 512 is 16 KiB of
-   u8, which fits cache; measure against the folded f32 GEMV under wasmtime, then on the page.
+   u8, which fits cache; measure against the folded f32 GEMV under Node, then on the page in
+   Chrome and Firefox.
 5. Measure heap and speed on the page; output must stay identical.
 
 ### Backlog, in order

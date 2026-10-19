@@ -343,3 +343,29 @@ mod fastenhancer_gate {
         assert_eq!(pick(64, 64, None), "wasm_f32_8x8");
     }
 }
+
+#[cfg(test)]
+mod dispatch_i32 {
+    use crate::mmm::MatMatMul;
+
+    fn preferred(n: usize) -> Box<dyn MatMatMul> {
+        crate::MmmDispatch::native()
+            .preferred_kernel(tract_data::prelude::DatumType::I32, Some(512), Some(512), Some(n))
+            .unwrap()
+    }
+
+    #[test]
+    fn int8_vector_takes_the_gemv_kernel() {
+        assert_eq!(preferred(1).name(), "wasm_i32_4x1");
+        assert_eq!(preferred(8).name(), "wasm_i32_4x4");
+    }
+
+    /// A matmul with a symbolic n packs its weights once and pairs a vector kernel with a
+    /// matrix one of the same A packing; without a shared packing the 4x4 runs every n = 1.
+    #[test]
+    fn int8_gemv_shares_the_matrix_kernel_a_packing() {
+        let (v, m) = (preferred(1), preferred(8));
+        let (va, ma) = (&*v.packings()[1].0, &*m.packings()[1].0);
+        assert!(va.merge_with(ma).is_some(), "{va} vs {ma}");
+    }
+}

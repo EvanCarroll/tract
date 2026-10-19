@@ -49,8 +49,9 @@ fn preferred(
     _suitable: &[crate::mmm::Suitable],
 ) -> Option<&'static str> {
     match (dt, query.n) {
-        // int8 -> i32 matmul: SIMD kernel (the generic scalar is the tier below).
-        (DatumType::I32, Some(1)) => None,
+        // int8 -> i32 matmul: the 4x1 for a vector, the 4x4 otherwise. They share an A
+        // packing, so a symbolic n, which never reaches here, pairs them at run time.
+        (DatumType::I32, Some(1)) => Some(wasm_i32_4x1.name.as_str()),
         (DatumType::I32, _) => Some(wasm_i32_4x4.name.as_str()),
         // GEMV routes by M-band to the kernel whose MR fits. Bands derived from
         // benches/wasm.rs: at each edge, using the next-larger kernel beats halving outer

@@ -36,7 +36,9 @@ fn main() {
     bench_i8_4x4::run();
 
     eprintln!();
-    eprintln!("=== int8 matvec (n=1): wasm_i32_4x4 vs generic_i32_4x1 ({target}) ===");
+    eprintln!(
+        "=== int8 matvec (n=1): wasm_i32_4x1 vs wasm_i32_4x4 vs generic_i32_4x1 ({target}) ==="
+    );
     bench_i8_matvec::run();
 
     eprintln!();
@@ -872,9 +874,9 @@ mod util {
     }
 }
 
-// int8 matrix-VECTOR (n=1): `wasm_i32_4x4` pays a 4x N-padding to use its SIMD tile, while
-// `generic_i32_4x1` is a scalar loop with no waste. Both expose the i8i8 packing (index 1) and
-// share a packing group, so a caller with a symbolic `n` picks between exactly these two.
+// int8 matrix-VECTOR (n=1): `wasm_i32_4x1`, the GEMV kernel, against `wasm_i32_4x4`, which pays a
+// 4x N-padding to use its SIMD tile, and the scalar `generic_i32_4x1`. All expose the i8i8
+// packing (index 1).
 #[cfg(target_arch = "wasm32")]
 mod bench_i8_matvec {
     use std::time::Instant;
@@ -923,14 +925,17 @@ mod bench_i8_matvec {
     }
 
     fn bench(m: usize, k: usize, iters: usize) {
+        let gemv = crate::util::pick("wasm_i32_4x1");
         let wasm = crate::util::pick("wasm_i32_4x4");
         let generic = crate::util::pick("generic_i32_4x1");
+        let v = min_of_n(&*gemv, m, k, 1, iters, 8);
         let w = min_of_n(&*wasm, m, k, 1, iters, 8);
         let g = min_of_n(&*generic, m, k, 1, iters, 8);
         eprintln!(
-            "m={m:<5} k={k:<5} n=1: wasm_i32_4x4={w:>9.0} generic_i32_4x1={g:>9.0} ns/call  \
-             the 4x4 costs {:.2}x the generic",
-            w / g
+            "m={m:<5} k={k:<5} n=1: wasm_i32_4x1={v:>9.0} wasm_i32_4x4={w:>9.0} \
+             generic_i32_4x1={g:>9.0} ns/call  4x1 speedup: {:.2}x over the 4x4, {:.2}x over the generic",
+            w / v,
+            g / v
         );
     }
 
@@ -941,5 +946,8 @@ mod bench_i8_matvec {
         bench(256, 256, 2_000);
         bench(256, 1536, 300);
         bench(1024, 256, 300);
+        bench(512, 512, 300);
+        bench(2048, 512, 100);
+        bench(512, 2048, 100);
     }
 }
