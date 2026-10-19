@@ -1,8 +1,9 @@
 //! Greedy opus-mt translation on tract, built natively and for `wasm32-unknown-unknown`, so the
 //! same code is measured on both against the Transformers.js baseline in `web/index.html`.
 //!
-//! The model is the Xenova q8 export split into encoder, first-step decoder and decoder with past;
-//! the merged decoder does not load (see `AGENTS.md`).
+//! The model is the Xenova q8 export: the encoder, then either the merged decoder (one file, a
+//! `use_cache_branch` `If` choosing the first step or a step with past) or the split pair of
+//! first-step decoder and decoder with past.
 
 pub mod error;
 
@@ -11,6 +12,7 @@ use std::sync::Arc;
 
 use tract_onnx::prelude::*;
 use tract_onnx::tract_core::ops::konst::Const;
+use tract_onnx::tract_core::ops::logic::OptIfThenElse;
 use wasm_bindgen::prelude::*;
 
 pub use error::Error;
@@ -25,27 +27,37 @@ const MAX_NEW_TOKENS: usize = 512;
 
 type Plan = Arc<TypedRunnableModel>;
 
-/// One of the three files of a split seq2seq export.
+/// One file of a seq2seq export.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Part {
     Encoder,
     Decoder,
     DecoderWithPast,
+    DecoderMerged,
 }
 
 impl Part {
-    pub const ALL: [Part; 3] = [Part::Encoder, Part::Decoder, Part::DecoderWithPast];
+    pub const SPLIT: [Part; 3] = [Part::Encoder, Part::Decoder, Part::DecoderWithPast];
+    pub const MERGED: [Part; 2] = [Part::Encoder, Part::DecoderMerged];
+
+    pub fn set(merged: bool) -> &'static [Part] {
+        if merged { &Part::MERGED } else { &Part::SPLIT }
+    }
 
     pub fn file(self) -> &'static str {
         match self {
             Part::Encoder => "encoder_model_quantized.onnx",
             Part::Decoder => "decoder_model_quantized.onnx",
             Part::DecoderWithPast => "decoder_with_past_model_quantized.onnx",
+            Part::DecoderMerged => "decoder_model_merged_quantized.onnx",
         }
     }
 
     fn from_index(ix: u8) -> Result<Part, Error> {
-        Part::ALL.get(ix as usize).copied().ok_or(Error::UnknownPart(ix))
+        [Part::Encoder, Part::Decoder, Part::DecoderWithPast, Part::DecoderMerged]
+            .get(ix as usize)
+            .copied()
+            .ok_or(Error::UnknownPart(ix))
     }
 }
 
@@ -98,6 +110,7 @@ pub fn set_input_facts(
             "input_ids" if part == Part::Encoder => i64::fact([b.clone(), s.clone()]).into(),
             "attention_mask" | "encoder_attention_mask" => i64::fact([b.clone(), s.clone()]).into(),
             "input_ids" => i64::fact([b.clone(), d.clone()]).into(),
+            "use_cache_branch" => bool::fact([1]).into(),
             "encoder_hidden_states" => {
                 f32::fact([b.clone(), s.clone(), cfg.hidden.to_dim()]).into()
             }
@@ -128,6 +141,28 @@ pub fn io_names(model: &InferenceModel) -> Result<(Vec<String>, Vec<String>), Er
         })
         .collect();
     Ok((inputs, outputs))
+}
+
+/// Splices in the tensors already folded in `shared`, folds the rest with [`fold_all_consts`]
+/// and adds them to `shared`, then does the same inside both branches of every `If`, which
+/// share the merged decoder's weights.
+pub fn fold(
+    model: &mut TypedModel,
+    shared: &mut HashMap<String, Arc<Tensor>>,
+) -> Result<(), Error> {
+    reuse_folds(model, shared)?;
+    shared.extend(fold_all_consts(model)?);
+    for node in &mut model.nodes {
+        let Some(op) = node.op_as::<OptIfThenElse>() else { continue };
+        let mut op = op.clone();
+        for plan in [&mut op.then_plan, &mut op.else_plan] {
+            let mut body = plan.model().clone();
+            fold(&mut body, shared)?;
+            *plan = TypedSimplePlan::new(body)?;
+        }
+        node.op = Box::new(op);
+    }
+    Ok(())
 }
 
 /// Replaces every node whose inputs are all constant by its value, whatever the size: the folds
@@ -223,20 +258,20 @@ fn load(
     let (inputs, outputs) = io_names(&model)?;
     let mut typed = model.into_optimized()?;
     if fold {
-        reuse_folds(&mut typed, shared)?;
-        shared.extend(fold_all_consts(&mut typed)?);
+        self::fold(&mut typed, shared)?;
     }
     Ok(Loaded { plan: typed.into_runnable()?, inputs, outputs })
 }
 
-/// Loads the three parts one at a time, so only one file's bytes are in memory at once. With
-/// `fold`, the decoder with past reuses the first decoder's folded weights.
+/// Loads the parts one at a time, so only one file's bytes are in memory at once: the encoder and
+/// either the merged decoder or both split decoders. With `fold`, the decoder with past reuses
+/// the first decoder's folded weights, and the merged decoder's branches each other's.
 #[wasm_bindgen]
 pub struct Loader {
     cfg: ModelConfig,
     fold: bool,
     shared: HashMap<String, Arc<Tensor>>,
-    parts: [Option<Loaded>; 3],
+    parts: [Option<Loaded>; 4],
 }
 
 #[wasm_bindgen]
@@ -246,7 +281,7 @@ impl Loader {
         Loader::new(config_json, fold).map_err(js)
     }
 
-    /// `part`: 0 encoder, 1 decoder, 2 decoder with past.
+    /// `part`: 0 encoder, 1 decoder, 2 decoder with past, 3 merged decoder.
     #[wasm_bindgen(js_name = add)]
     pub fn js_add(&mut self, part: u8, bytes: Vec<u8>) -> Result<(), JsError> {
         Part::from_index(part).and_then(|p| self.add(p, &bytes)).map_err(js)
@@ -264,7 +299,7 @@ impl Loader {
             cfg: ModelConfig::from_json(config_json)?,
             fold,
             shared: HashMap::new(),
-            parts: [None, None, None],
+            parts: [None, None, None, None],
         })
     }
 
@@ -275,13 +310,20 @@ impl Loader {
     }
 
     pub fn finish(self, tokenizer_json: &str) -> Result<Translator, Error> {
-        let [enc, dec, dec_past] = self.parts;
+        let [enc, dec, dec_past, merged] = self.parts;
+        let (dec, dec_past) = match merged {
+            Some(merged) => (merged, None),
+            None => (
+                dec.ok_or(Error::MissingPart("decoder"))?,
+                Some(dec_past.ok_or(Error::MissingPart("decoder with past"))?),
+            ),
+        };
         Ok(Translator {
             tok: tokenizers::Tokenizer::from_bytes(tokenizer_json.as_bytes())?,
             cfg: self.cfg,
             enc: enc.ok_or(Error::MissingPart("encoder"))?,
-            dec: dec.ok_or(Error::MissingPart("decoder"))?,
-            dec_past: dec_past.ok_or(Error::MissingPart("decoder with past"))?,
+            dec,
+            dec_past,
         })
     }
 }
@@ -297,8 +339,9 @@ pub struct Translator {
     tok: tokenizers::Tokenizer,
     cfg: ModelConfig,
     enc: Loaded,
+    /// The first-step decoder, or the merged decoder when `dec_past` is `None`.
     dec: Loaded,
-    dec_past: Loaded,
+    dec_past: Option<Loaded>,
 }
 
 #[wasm_bindgen]
@@ -313,6 +356,10 @@ impl Translator {
 
 impl Translator {
     /// Greedy decoding with the padding token banned, as Marian's generation config asks.
+    ///
+    /// The merged decoder's first step still takes past key/values: empty for the decoder, and
+    /// zeros of the source length for the encoder, which the branch ignores. Its later steps
+    /// return empty encoder key/values, so the first step's are kept.
     pub fn translate(&self, text: &str) -> Result<Translation, Error> {
         let ids: Vec<i64> =
             self.tok.encode(text, true)?.get_ids().iter().map(|&i| i as i64).collect();
@@ -323,9 +370,16 @@ impl Translator {
         let mut out: Vec<u32> = vec![];
         let mut next = self.cfg.decoder_start;
         let mut past: HashMap<String, TValue> = HashMap::new();
+        let head_dim = self.cfg.hidden / self.cfg.heads;
+        let no_past = Tensor::zero::<f32>(&[1, self.cfg.heads, 0, head_dim])?.into_tvalue();
+        let no_encoder_past = Tensor::zero::<f32>(&[1, self.cfg.heads, n, head_dim])?.into_tvalue();
         for step in 0..MAX_NEW_TOKENS {
             let token = Tensor::from_shape(&[1, 1], &[next])?.into_tvalue();
-            let dec = if step == 0 { &self.dec } else { &self.dec_past };
+            let use_cache = tensor1(&[step > 0]).into_tvalue();
+            let dec = match &self.dec_past {
+                Some(dec_past) if step > 0 => dec_past,
+                _ => &self.dec,
+            };
             let inputs = dec
                 .inputs
                 .iter()
@@ -333,6 +387,9 @@ impl Translator {
                     "input_ids" => Ok(token.clone()),
                     "encoder_attention_mask" => Ok(mask.clone()),
                     "encoder_hidden_states" => Ok(hidden.clone()),
+                    "use_cache_branch" => Ok(use_cache.clone()),
+                    n if step == 0 && n.contains(".decoder.") => Ok(no_past.clone()),
+                    n if step == 0 && n.contains(".encoder.") => Ok(no_encoder_past.clone()),
                     n => past
                         .get(&n.replace("past_key_values", "present"))
                         .cloned()
@@ -344,7 +401,8 @@ impl Translator {
             for (name, value) in dec.outputs.iter().zip(res) {
                 if name == "logits" {
                     logits = Some(value);
-                } else if name.starts_with("present") {
+                } else if name.starts_with("present") && (step == 0 || !name.contains(".encoder."))
+                {
                     past.insert(name.clone(), value);
                 }
             }

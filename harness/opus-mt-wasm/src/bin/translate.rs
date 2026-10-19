@@ -17,6 +17,9 @@ struct Args {
     /// Fold constant weights the optimizer leaves to be recomputed every step.
     #[arg(long)]
     fold: bool,
+    /// Load the merged decoder rather than the split pair.
+    #[arg(long)]
+    merged: bool,
     #[arg(long, default_value_t = 3)]
     reps: usize,
     /// Text to translate; defaults to the benchmark sentences.
@@ -29,7 +32,7 @@ fn main() -> Result<(), Error> {
     let read = |f: &str| std::fs::read_to_string(args.models.join(f));
     let t = Instant::now();
     let mut loader = Loader::new(&read("config.json")?, args.fold)?;
-    for part in Part::ALL {
+    for &part in Part::set(args.merged) {
         loader.add(part, &std::fs::read(args.models.join(part.file()))?)?;
     }
     let translator = loader.finish(&read("tokenizer.json")?)?;

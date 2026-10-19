@@ -14,7 +14,9 @@ pub enum Error {
     Config(&'static str),
     #[error("model input `{0}` is not one the harness knows how to feed")]
     UnexpectedInput(String),
-    #[error("model part index {0} is not 0 (encoder), 1 (decoder) or 2 (decoder with past)")]
+    #[error(
+        "model part index {0} is not 0 (encoder), 1 (decoder), 2 (decoder with past) or 3 (merged decoder)"
+    )]
     UnknownPart(u8),
     #[error("{0} was never loaded")]
     MissingPart(&'static str),

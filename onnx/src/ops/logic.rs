@@ -50,17 +50,27 @@ pub fn _if(
         .map(|i| unresolved_inputs.iter().position(|s| s == i).unwrap() + 1)
         .collect();
     Ok((
-        Box::new(If { then_body, then_input_mapping, else_body, else_input_mapping }),
+        Box::new(If {
+            then_body,
+            then_input_mapping,
+            else_body,
+            else_input_mapping,
+            runtime_dims: vec![],
+        }),
         unresolved_inputs,
     ))
 }
 
+/// ONNX `If`. With a condition unknown at load, each output takes the join of the two branches'
+/// facts: a dim both branches know and disagree on gets a fresh symbol, recorded in
+/// `runtime_dims` as `(output, axis, symbol)` and bound at runtime by the typed `IfThenElse`.
 #[derive(Debug, Clone, new)]
 pub struct If {
     pub then_body: InferenceModel,
     then_input_mapping: Vec<usize>,
     pub else_body: InferenceModel,
     else_input_mapping: Vec<usize>,
+    runtime_dims: Vec<(usize, usize, Symbol)>,
 }
 impl PartialEq for If {
     fn eq(&self, _: &Self) -> bool {
@@ -127,27 +137,39 @@ impl InferenceOp for If {
                 }
             } else {
                 for ix in 0..self.nboutputs()? {
-                    changed = changed
-                        || self
-                            .then_body
-                            .output_fact_mut(ix)?
-                            .shape
-                            .unify_with_mut(&mut outputs[ix].shape)?
-                        || self
-                            .else_body
-                            .output_fact_mut(ix)?
-                            .shape
-                            .unify_with_mut(&mut outputs[ix].shape)?
-                        || self
-                            .then_body
-                            .output_fact_mut(ix)?
-                            .datum_type
-                            .unify_with_mut(&mut outputs[ix].datum_type)?
-                        || self
-                            .else_body
-                            .output_fact_mut(ix)?
-                            .datum_type
-                            .unify_with_mut(&mut outputs[ix].datum_type)?;
+                    for body in [&mut self.then_body, &mut self.else_body] {
+                        changed = changed
+                            || body
+                                .output_fact_mut(ix)?
+                                .datum_type
+                                .unify_with_mut(&mut outputs[ix].datum_type)?;
+                    }
+                    let then_shape = &self.then_body.output_fact(ix)?.shape;
+                    let else_shape = &self.else_body.output_fact(ix)?.shape;
+                    if !then_shape.is_open()
+                        && !else_shape.is_open()
+                        && then_shape.dims().count() == else_shape.dims().count()
+                    {
+                        let mut dims = tvec!();
+                        for (axis, (t, e)) in then_shape.dims().zip(else_shape.dims()).enumerate() {
+                            let known = t.concretize().is_some() && e.concretize().is_some();
+                            if t == e {
+                                dims.push(t.clone());
+                            } else if let Some((_, _, sym)) =
+                                self.runtime_dims.iter().find(|(o, a, _)| *o == ix && *a == axis)
+                            {
+                                dims.push(sym.to_dim().into());
+                            } else if known {
+                                let sym = self.then_body.symbols.new_with_prefix("if");
+                                dims.push(sym.to_dim().into());
+                                self.runtime_dims.push((ix, axis, sym));
+                            } else {
+                                dims.push(GenericFactoid::Any);
+                            }
+                        }
+                        let joined = ShapeFactoid::closed(dims);
+                        changed = changed || outputs[ix].shape.unify_with(&joined)?;
+                    }
                 }
             }
             changed = changed || self.then_body.analyse(false)?;
@@ -185,6 +207,8 @@ impl InferenceOp for If {
             else_body,
             then_input_mapping: self.then_input_mapping.clone(),
             else_input_mapping: self.else_input_mapping.clone(),
+            runtime_dims: self.runtime_dims.clone(),
+            decluttered: false,
         };
         target.wire_node(self.name(), op, &inputs)
     }

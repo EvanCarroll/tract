@@ -44,14 +44,18 @@ machine. Sizes in MiB. ms per token is the page's median over both sentences, wa
 | tract, `mode=tract` | 61.2 | 594 | 2.1 s | same |
 | tract, `&fold=1` | 30.8 | 594 | 2.8 s | same |
 | tract, `&fold=1&models=models-int8` | 37.8 | 367 | 2.3 s | **differs** ("gebrochen") |
+| tract, `&merged=1` | 60.6 | 482 | 2.2 s | same |
+| tract, `&merged=1&fold=1` | 28.3 | 482 | 2.7 s | same |
 
 The `ort-noqdq` row was measured on 2026-10-18 with an earlier page that averaged all
-repetitions.
+repetitions. The `merged` rows were measured on a loaded machine, back to back with
+`mode=ort` (22.3 ms/token, 382 MiB) and `&fold=1` (28.3 ms/token, 594 MiB): compare them with
+those, not with the rows above.
 
 | Download | Baseline | tract |
 |---|---|---|
 | runtime (brotli / gzip / raw) | **2.11 / 3.31 / 12.90** | 2.62 / 4.24 / 15.22 |
-| model | **101** (encoder 47 + merged decoder 54) | 151 (split decoders 104) |
+| model | **101** (encoder 47 + merged decoder 54) | 101 with `&merged=1`; 151 split (decoders 104) |
 
 Parity means every tract cell at or below the bold baseline cell, with the same output.
 
@@ -69,8 +73,8 @@ checkout's `onnx` crate by path, so a change anywhere in tract is measured by re
 
 ```sh
 ./scripts/fetch.sh            # models + baseline runtime (integrity-checked), gitignored
-cargo run --release --bin translate -- [--fold]        # native: load, ms/token, peak RSS
-cargo run --release --bin mem -- [--fold]              # native: heap live/peak per load stage
+cargo run --release --bin translate -- [--merged] [--fold]  # native: load, ms/token, peak RSS
+cargo run --release --bin mem -- [--merged] [--fold]        # native: heap live/peak per load stage
 ./scripts/profile-step.sh     # per-node profile of one decoder step (tract CLI)
 ./scripts/make-int8-lm-head.sh  # models-int8/: output projection rewritten to integer form
 ./scripts/build-wasm.sh       # web/pkg + size table, tract vs baseline
@@ -81,7 +85,7 @@ Then open, one page load per configuration:
 
 - `index.html?mode=ort`: the baseline;
 - `index.html?mode=ort-noqdq`: the baseline folding every `DequantizeLinear`;
-- `index.html?mode=tract`, adding `&fold=1` and/or `&models=models-int8`.
+- `index.html?mode=tract`, adding `&merged=1`, `&fold=1` and/or `&models=models-int8`.
 
 The page prints each translation, then a JSON summary: load time, median ms per token
 (warm-up repetition excluded), peak heap, outputs. Drive it with the Playwright MCP server
@@ -90,7 +94,7 @@ The page prints each translation, then a JSON summary: load time, median ms per 
 ### Measurement rules
 
 - **Nothing else running.** A concurrent `cargo build` once inflated the baseline from 23 to
-  52-60 ms/token. Check `pgrep -a cargo rustc` first. Native numbers are noisier than browser
+  52-60 ms/token. Check `pgrep -a 'cargo|rustc'` first. Native numbers are noisier than browser
   ones for the same reason; trust the browser.
 - **One configuration per page load.** A WASM heap never shrinks, so a second runtime in the
   same page measures the first one's high-water mark too.
@@ -104,12 +108,18 @@ The page prints each translation, then a JSON summary: load time, median ms per 
 ## What we know
 
 ### The model and how tract loads it
-- The **merged** decoder does not load: its `use_cache_branch` `If` has branches whose present
-  key/value outputs differ in one symbolic dim (`D` against `D+P`), and tract requires both
-  branches to agree. `onnx/src/ops/logic.rs` (`If::infer_facts`, dynamic-condition arm) unifies
-  both bodies into one outer fact; `core/src/ops/logic/ite.rs` (`IfThenElse::output_facts`)
-  ensures equality. Upstream: sonos/tract#2695, #1062. The harness therefore uses the split
-  exports, which ship the decoder weights twice.
+- The **merged** decoder loads (`--merged`, `&merged=1`). Its `use_cache_branch` `If` has
+  branches whose outputs disagree: present decoder key/values `D` against `P+1`, and the cached
+  branch returns dummy `[0, 8, 1, 64]` constants for the encoder key/values, so even the batch
+  dim differs. `If::infer_facts` joins the branches and mints a symbol per disagreeing dim;
+  `IfThenElse` carries them in `runtime_dims` and the plan binds them from the taken branch's
+  outputs. Every weight reaches the bodies as an outer input: `IfThenElse` declutter pulls
+  constant inputs into the bodies before decluttering them, and codegen plans both bodies once
+  (`OptIfThenElse`). Covered by `harness/onnx-test-cases/dynamic-if`. Branches of different
+  rank (the sonos/tract#2695 reproducer) are still refused.
+- The merged decoder's first step still takes past key/values: the harness feeds an empty
+  decoder past and a zero encoder past of the source length (pinned to the same symbol as the
+  mask). Later steps' encoder present outputs are the dummies, so the first step's are kept.
 - The export names the source length twice (`encoder_sequence_length`,
   `encoder_sequence_length_out`); tract cannot prove them equal. `set_input_facts` pins one
   symbol for both. The CLI cannot bind symbols before analysis (sonos/tract#2650), hence
@@ -134,6 +144,11 @@ The page prints each translation, then a JSON summary: load time, median ms per 
   only counts in the browser.
 
 ### Memory
+- Merged, each branch packs its own copy of the weights it uses (about 25 MiB of duplication
+  natively), yet the merged decoder is still below the split pair: `mem --merged --fold` peaks at
+  370 MiB and settles at 248, against 388 and 276 split. In WASM the load peak drops from 594 to
+  482 MiB, the same as unfolded merged: the per-step f32 dequantization of the output
+  projection reaches it too.
 - Steady state without the fold is about the size of the model files: the int8 weights stay int8.
 - Loading holds the file bytes, the decoded protobuf and the `InferenceModel` at once, about 3×
   the file, transiently. In WASM the heap never shrinks, so transients become the footprint.
@@ -161,21 +176,10 @@ The page prints each translation, then a JSON summary: load time, median ms per 
 In order. Each item says what it should buy; measure before and after with the rules above,
 and record the result in the tables.
 
-1. **Merged decoder: dynamic `If` with differing branch shapes.**
-   - In `If::infer_facts`, when the condition is not known, take the join of the two bodies'
-     output facts: same datum type and rank; a dim the branches agree on is kept, any other left
-     open. Stop pushing outer facts back into the bodies.
-   - In `to_typed`, mint a symbol per disagreeing dim (`target.symbols.new_with_prefix`), store
-     them in `IfThenElse`, use them in `output_facts`, and return `true` from
-     `mints_runtime_symbols` so the plan binds them from the actual outputs (as `NonZero` does).
-   - `IfThenElse::eval` clones the body and builds a plan on every call, and the bodies are never
-     decluttered or optimized. The merged decoder lives entirely inside the bodies, so this is
-     the whole model: declutter and optimize the bodies and keep spawned plans in an `OpState`,
-     following `Scan` (`core/src/ops/scan/decluttered.rs` `declutter_body`,
-     `core/src/ops/scan/optimized.rs` `state`).
-   - Test with the reproducer from #2695 in the ONNX suite, then the merged decoder here.
-   - Buys: model download 151 → 101 MiB, one decoder's weights and one load spike off the
-     heap. The harness then loads two parts, not three.
+1. ~~**Merged decoder: dynamic `If` with differing branch shapes.**~~ Done: model download
+   151 → 101 MiB, WASM peak 594 → 482 MiB, same speed and output. Left over: the two branches
+   pack the shared weights twice; and `IfThenElse` has no NNEF form and no `set_symbols`.
+   Make `&merged=1` the default configuration once measured on an idle machine.
 2. **Load memory: the WASM peak today.** Loading a part holds its file bytes, the decoded
    protobuf and the `InferenceModel` at once. Decode initializers without copying them again
    into tensors (protobuf `raw_data` straight into tensor storage), and release each

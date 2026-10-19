@@ -55,6 +55,8 @@ struct Args {
     models: PathBuf,
     #[arg(long)]
     fold: bool,
+    #[arg(long)]
+    merged: bool,
 }
 
 fn main() -> Result<(), Error> {
@@ -63,7 +65,7 @@ fn main() -> Result<(), Error> {
     let mut shared = std::collections::HashMap::new();
     let mut kept = vec![];
     report("start");
-    for part in Part::ALL {
+    for &part in Part::set(args.merged) {
         let bytes = std::fs::read(args.models.join(part.file()))?;
         report(&format!("{}: bytes read", part.file()));
         let proto = tract_onnx::onnx().proto_model_for_read(&mut &*bytes)?;
@@ -79,9 +81,7 @@ fn main() -> Result<(), Error> {
         let mut typed = model.into_optimized()?;
         report("  optimized (InferenceModel dropped)");
         if args.fold {
-            let reused = tract_opus_mt::reuse_folds(&mut typed, &shared)?;
-            report(&format!("  reused {reused} folds"));
-            shared.extend(tract_opus_mt::fold_all_consts(&mut typed)?);
+            tract_opus_mt::fold(&mut typed, &mut shared)?;
             report("  folded");
         }
         kept.push(typed.into_runnable()?);

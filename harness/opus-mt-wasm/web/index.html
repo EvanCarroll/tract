@@ -6,7 +6,7 @@
 // One runtime per page load, so each gets a fresh WebAssembly heap:
 //   ?mode=ort                     baseline: Transformers.js + onnxruntime-web, as chattyness ships it
 //   ?mode=ort-noqdq               baseline with session.disable_quant_qdq (folds every DequantizeLinear)
-//   ?mode=tract[&fold=1][&models=models-int8]
+//   ?mode=tract[&merged=1][&fold=1][&models=models-int8]
 // The last line is a JSON summary.
 const SENTENCES = [
   "Hello, how are you doing today?",
@@ -40,8 +40,10 @@ async function loadTract() {
   const dir = params.get("models") ?? "models";
   const text = async (f) => (await fetch(`/${dir}/${f}`)).text();
   const loader = new Loader(await text("config.json"), params.get("fold") === "1");
-  const parts = ["encoder_model_quantized.onnx", "decoder_model_quantized.onnx", "decoder_with_past_model_quantized.onnx"];
-  for (const [ix, file] of parts.entries()) {
+  const parts = params.get("merged") === "1"
+    ? [[0, "encoder_model_quantized.onnx"], [3, "decoder_model_merged_quantized.onnx"]]
+    : [[0, "encoder_model_quantized.onnx"], [1, "decoder_model_quantized.onnx"], [2, "decoder_with_past_model_quantized.onnx"]];
+  for (const [ix, file] of parts) {
     loader.add(ix, new Uint8Array(await (await fetch(`/${dir}/${file}`)).arrayBuffer()));
     log(`  loaded ${file}: heap ${heap()} MB`);
   }

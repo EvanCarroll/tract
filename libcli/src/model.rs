@@ -75,6 +75,13 @@ pub trait Model:
         if let Some(mir) = self.node_op(id).downcast_ref::<tract_core::ops::scan::Scan>() {
             return vec![("loop".into(), &mir.body)];
         }
+        if let Some(lir) = self.node_op(id).downcast_ref::<tract_core::ops::logic::OptIfThenElse>()
+        {
+            return vec![
+                ("then".into(), lir.then_plan.model()),
+                ("else".into(), lir.else_plan.model()),
+            ];
+        }
         if let Some(mir) = self.node_op(id).downcast_ref::<tract_core::ops::logic::IfThenElse>() {
             return vec![("then".into(), &mir.then_body), ("else".into(), &mir.else_body)];
         }
