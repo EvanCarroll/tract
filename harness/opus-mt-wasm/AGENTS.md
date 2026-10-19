@@ -142,6 +142,17 @@ The page prints each translation, then a JSON summary: load time, median ms per 
   reference output, WASM 37.8 ms/token with a **different** second sentence ("kaputt gemacht" →
   "gebrochen"). The same model gives different words natively and in WASM, so an output check
   only counts in the browser.
+- A decode step's weight matmuls are all 8-bit (`DynamicQuantizeLinear` activations,
+  `MatMulInteger` weights, i32 accumulator) with **n = 1**: per layer, 6 with m = k = 512
+  (self-attention q/k/v/o, cross-attention q/o) and fc1/fc2 (512 × 2048), 36 in all
+  (`tract ... -O dump --audit-json` on the decoder with past). In WASM none of them gets a SIMD
+  kernel: `linalg/src/wasm/mod.rs` `preferred()` answers `None` for `(I32, Some(1))`, so the
+  generic tier picks `generic_i32_4x1`, scalar Rust. The only WASM int8 kernel is
+  `wasm_i32_4x4`, chosen for n > 1 (the encoder, the first step). f32 GEMV has
+  `wasm_f32_{4,8,16,32}x1` routed by M band.
+- Folded, the output projection is one f32 GEMV, m = 58101, k = 512: 30 M multiply-adds and
+  117 MiB of weights streamed every token, more than the 36 int8 matmuls together (22 M, 22 MiB).
+  It is probably memory-bound in WASM.
 
 ### Memory
 - Merged, each branch packs its own copy of the weights it uses (about 25 MiB of duplication
@@ -173,50 +184,110 @@ The page prints each translation, then a JSON summary: load time, median ms per 
 
 ## Plan to parity
 
-In order. Each item says what it should buy; measure before and after with the rules above,
-and record the result in the tables.
+Where tract stands against the baseline, last measured 2026-10-19 (loaded machine, back to back):
+speed 28.3 vs 22.3 ms/token, peak heap 482 vs 382 MiB, runtime download 2.62 vs 2.11 MiB brotli,
+model download at parity (101 MiB, `&merged=1`), output the same.
+
+Each item says what it should buy; measure before and after with the rules above, and record
+the result in the tables.
+
+### Next iteration: the 8-bit decode matmuls (A) and the output projection (B)
+
+The largest lever on each remaining axis, both in the matmul layer. Do A first: it is self-contained
+in `linalg/src/wasm`, and B's kernel work builds on what it teaches. Both need an idle machine for
+the browser numbers; check before measuring, and redo the two `merged` rows of the targets table
+first so there is a clean "before".
+
+**A. A SIMD int8 GEMV kernel for WASM.** Speed: every weight matmul of every decode step.
+1. Confirm the cost before writing code. Time `generic_i32_4x1` against `wasm_i32_4x4` at
+   m = 512, k = 512 and m = 2048, k = 512 / m = 512, k = 2048, n = 1, under wasmtime: extend
+   `linalg/benches/wasm.rs` (its header has the command; `wasmtime` and the `wasm32-wasip1`
+   target are installed). Also try the cheap variant: route `(I32, Some(1))` to
+   `wasm_i32_4x4` in `preferred()` and measure the page — if that alone moves ms/token, the
+   case is made.
+2. Write `wasm_i32_{8,16}x1` (or whatever MR the bench favours) in `linalg/src/wasm/mmm_i32.rs`,
+   on the model of `mmm_f32_gemv.rs` for the GEMV structure and `wasm_i32_4x4` for the
+   int8 multiply (widening i8→i16→i32 `extmul` under plain simd128; the relaxed-simd dot path
+   exists in `wasm_i32_4x4`). Keep the epilogue on the shared scalar quant path, as
+   `wasm_i32_4x4` does: integer accumulation is exact, so the kernel must be bit-identical to
+   the generic one, and the `frame/mmm` kernel tests check it (run them under wasmtime, see
+   `linalg/src/wasm/mod.rs` header).
+3. Route `(I32, Some(1))` to it by M band, as the f32 GEMV arm does, and update the
+   `preferred()` doc comment and `dispatch_tests.rs`.
+4. Measure: wasm bench, then the page (`&merged=1&fold=1`); output must stay identical.
+5. Separately, try `+relaxed-simd` in `build-wasm.sh` (int8 dot instruction, fused f32
+   multiply-add). Chrome has it; other browsers may not, so it may mean a second build. Record
+   the gain either way.
+
+**B. Keep the output projection as uint8, dequantized inside the matmul.** Heap (−117 MiB of f32
+weight, and the fold's transient) and speed (4× less weight traffic per token). A matmul taking
+f32 activations and int8 weights keeps the activations unquantized, which matters: quantizing
+them (`models-int8`) changed the output.
+1. The weight is `model.shared.weight_transposed` (58101 × 512 uint8) through
+   `DequantizeLinear` with **one scale and one zero point for the whole tensor**, feeding the
+   f32 `MatMul` of `/lm_head/MatMul`, inside both branches of the merged decoder. Dequantizing
+   `(u - zp) * scale` element-wise gives exactly the values the fold produces today, so a kernel
+   that does that per panel, then runs the same f32 kernel, gives the same logits and output.
+2. The machinery exists: block-quant weights (`linalg/src/frame/block_quant`: `Q4_0`, `Q8_1`,
+   `BlockQuantStorage`) are consumed by f32 kernels through a `PanelExtractor`
+   (`linalg/src/frame/mmm/panel_extract.rs`) that dequantizes one panel at a time; core wires
+   them through `core/src/ops/matmul/pack.rs` and `core/src/ops/einsum`. Do **not** requantize
+   into `Q8_1` (symmetric, per-32-block scales): it changes the values, and the output with them.
+   Add a lossless format instead: uint8 with a per-tensor scale and zero point (or reuse an
+   existing one if it already fits — check `frame/weights.rs` and `block_quant/mod.rs` first).
+3. A declutter rule turning `DequantizeLinear(const u8, scalar scale, scalar zp) → f32 matmul`
+   into a matmul over that storage, so the decision lives in tract, not the harness (this also
+   closes item 5). The harness fold then has nothing large left to fold; check it no longer
+   creates the 117 MiB tensor (`mem --merged --fold`, the `folded` stage).
+4. Its WASM panel extractor must keep the GEMV fast: one panel of 32 rows × 512 is 16 KiB of
+   u8, which fits cache; measure against the folded f32 GEMV under wasmtime, then on the page.
+5. Measure heap and speed on the page; output must stay identical.
+
+### Backlog, in order
 
 1. ~~**Merged decoder: dynamic `If` with differing branch shapes.**~~ Done: model download
    151 → 101 MiB, WASM peak 594 → 482 MiB, same speed and output. Left over: the two branches
-   pack the shared weights twice; and `IfThenElse` has no NNEF form and no `set_symbols`.
-   Make `&merged=1` the default configuration once measured on an idle machine.
-2. **Load memory: the WASM peak today.** Loading a part holds its file bytes, the decoded
-   protobuf and the `InferenceModel` at once. Decode initializers without copying them again
-   into tensors (protobuf `raw_data` straight into tensor storage), and release each
-   initializer's protobuf as it is consumed. Verify with `mem` (the per-stage peaks) and the
-   page's per-part heap lines. Buys: up to about 2× the largest file of peak heap.
-3. **Speed: the remaining 31 → 23 ms/token.** `profile-step.sh` profiles the step without the
-   fold, so skip the output projection's `DequantizeLinear` and pack nodes (the fold removes
-   them) and look at what remains. Find where WASM loses to onnxruntime and attack the top
-   nodes. Candidates: the
-   encoder per message (the short sentence costs more per token on both runtimes), attention
-   matmuls with a growing past, `linalg/src/wasm` kernels.
-4. **Fold without the f32 spike.** Pack the output projection straight from its uint8 form
-   rather than materializing the 117 MiB f32 tensor first, or fold the `DequantizeLinear` and
-   the pack as one step. Matters once item 2 brings the load peak below the fold's.
-5. **Make the large fold a tract decision, not a harness pass.** An opt-in budget for
-   `PropConst`, or a rule that folds a weight whose consumer is a matmul pack. The harness pass
-   walks the model by hand, which the root rules forbid inside tract.
-6. **Native/WASM divergence on the integer path.** `models-int8` gives the reference output
-   natively and a different word in WASM. Find out whether that is a near-tie in the logits or
-   a WASM kernel computing something different (compare the logits of both builds at the step
-   that diverges). A kernel bug blocks every integer-path idea.
-7. **Speed without f32 weights.** A matmul taking f32 activations and int8 weights
-   dequantized inside the kernel keeps the weight at 30 MiB without quantizing activations
-   (which changed the output). Then the f32 fold, and items 4-5, may not be needed at all.
-8. **Runtime size.** The 0.5 MiB brotli gap is the `tokenizers` crate. Options: tokenize in JS
-   in the worker and pass ids; a slimmer Unigram-only tokenizer; `opt-level = "s"` and measure
-   the speed cost.
-9. **Second model.** Only opus-mt-en-de has been measured. Before calling parity, run an opus-mt
-   multi-target model (`Xenova/opus-mt-en-ROMANCE`, which needs a `>>lang<<` token) and
-   `Xenova/m2m100_418M` (1024 wide, 16 heads, about 5× slower in the baseline): neither has been
-   loaded in tract yet.
+   pack the shared weights twice (about 25 MiB); and `IfThenElse` has no NNEF form and no
+   `set_symbols`. Make `&merged=1` the default configuration once measured on an idle machine.
+2. **Load memory.** Loading a part holds its file bytes, the decoded protobuf and the
+   `InferenceModel` at once (+58 MiB each for the merged decoder natively, optimizing peaks at
+   274 MiB). Decode initializers without copying them again into tensors (protobuf `raw_data`
+   straight into tensor storage), and release each initializer's protobuf as it is consumed.
+   Verify with `mem` and the page's per-part heap lines. Buys: up to about 2× the largest file
+   of peak heap.
+3. **Profile in WASM.** `profile-step.sh` profiles natively, where tract is 2-4× faster and may
+   rank nodes differently. A per-node timing export from the WASM build (the harness could
+   expose one through wasm-bindgen) would make every speed item measurable rather than guessed.
+4. **Speed: what remains after A and B.** Candidates: reuse the decoder's state across steps
+   (the harness calls `plan.run` every token, which spawns a fresh state — with the merged
+   decoder, the `If` branch's ~1600-node state too); the `DynamicQuantizeLinearU8` of
+   `encoder_hidden_states` sits outside the `If` and runs every step though only the first-step
+   branch uses it; the encoder per message (the short sentence costs more per token on both
+   runtimes); attention matmuls and present concat with a growing past.
+5. **Share the merged decoder's packed weights between branches** (about 25 MiB).
+6. **Fold without the f32 spike.** Only if B does not land: pack the output projection
+   straight from uint8, or fold the `DequantizeLinear` and the pack as one step.
+7. **Make the large fold a tract decision, not a harness pass**, if B leaves any: an opt-in
+   budget for `PropConst`, or a rule that folds a weight whose consumer is a matmul pack. The
+   harness pass walks the model by hand, which the root rules forbid inside tract.
+8. **Native/WASM divergence on the integer path.** `models-int8` gives the reference output
+   natively and a different word in WASM. Integer accumulation is exact, so compare the logits
+   of both builds at the step that diverges: a difference before the f32 rescale is a kernel
+   bug. A's new kernel makes this cheaper to settle, and a kernel bug blocks every integer-path
+   idea.
+9. **Runtime size.** The 0.5 MiB brotli gap is the `tokenizers` crate. Options: tokenize in JS
+   in the worker (Transformers.js's tokenizer is far smaller) and pass ids; a slimmer
+   Unigram-only tokenizer; `opt-level = "s"` and measure the speed cost.
+10. **Second model.** Only opus-mt-en-de has been measured. Before calling parity, run an opus-mt
+    multi-target model (`Xenova/opus-mt-en-ROMANCE`, which needs a `>>lang<<` token) and
+    `Xenova/m2m100_418M` (1024 wide, 16 heads, about 5× slower in the baseline): neither has
+    been loaded in tract yet.
 
 ## Harness layout
 
 | Path | What it is |
 |---|---|
-| `src/lib.rs` | `Loader`, `Translator`, `set_input_facts`, `fold_all_consts`, `reuse_folds`; the wasm-bindgen surface |
+| `src/lib.rs` | `Loader`, `Translator`, `set_input_facts`, `fold`, `fold_all_consts`, `reuse_folds`; the wasm-bindgen surface |
 | `src/bin/translate.rs` | native benchmark |
 | `src/bin/mem.rs` | counting allocator, heap per load stage |
 | `src/bin/rewrite_lm_head.rs` | ONNX surgery: output projection to integer form |
