@@ -90,3 +90,10 @@ them on any conflict.
   of the PR description.
 - Follow-up questions/review replies are handled by a HUMAN, not the bot. The
   maintainer wants to talk to the author, not prompt an LLM.
+
+## Fork work: opus-mt in the browser
+- This fork is working towards running opus-mt translation in browser WASM at parity with
+  onnxruntime-web. Before any work on that — `If`, constant folding, quantized matmul, WASM
+  kernels, ONNX loading memory — read
+  [`harness/opus-mt-wasm/AGENTS.md`](harness/opus-mt-wasm/AGENTS.md): the targets, how to
+  measure against them, what is already known, and the plan.

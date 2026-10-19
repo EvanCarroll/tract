@@ -1,0 +1,9 @@
+/target
+/Cargo.lock
+/models
+/models-int8
+/web/pkg
+/web/vendor
+/web/hub
+/web/models
+/web/models-int8

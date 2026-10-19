@@ -1,0 +1,102 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>opus-mt runtime bench</title>
+<pre id="out"></pre>
+<script type="module">
+// One runtime per page load, so each gets a fresh WebAssembly heap:
+//   ?mode=ort                     baseline: Transformers.js + onnxruntime-web, as chattyness ships it
+//   ?mode=ort-noqdq               baseline with session.disable_quant_qdq (folds every DequantizeLinear)
+//   ?mode=tract[&fold=1][&models=models-int8]
+// The last line is a JSON summary.
+const SENTENCES = [
+  "Hello, how are you doing today?",
+  "I think the new update broke the chat window, can someone restart the server before the meeting starts?",
+];
+const REPS = 3;
+const params = new URLSearchParams(location.search);
+const mode = params.get("mode") ?? "ort";
+const out = document.getElementById("out");
+const log = (s) => { out.textContent += s + "\n"; };
+const mb = (bytes) => Math.round(bytes / 2 ** 20);
+
+// The heap is whatever WebAssembly.Memory the runtime creates or imports; it only ever grows,
+// so its size at the end is the peak.
+const memories = new Set();
+for (const name of ["instantiate", "instantiateStreaming"]) {
+  const original = WebAssembly[name];
+  WebAssembly[name] = async (source, imports) => {
+    const result = await original.call(WebAssembly, source, imports);
+    const instance = result.instance ?? result;
+    for (const v of Object.values(instance.exports ?? {})) if (v instanceof WebAssembly.Memory) memories.add(v);
+    for (const ns of Object.values(imports ?? {})) for (const v of Object.values(ns ?? {})) if (v instanceof WebAssembly.Memory) memories.add(v);
+    return result;
+  };
+}
+const heap = () => mb([...memories].reduce((sum, m) => sum + m.buffer.byteLength, 0));
+
+async function loadTract() {
+  const { default: init, Loader } = await import("/pkg/tract_opus_mt.js");
+  await init();
+  const dir = params.get("models") ?? "models";
+  const text = async (f) => (await fetch(`/${dir}/${f}`)).text();
+  const loader = new Loader(await text("config.json"), params.get("fold") === "1");
+  const parts = ["encoder_model_quantized.onnx", "decoder_model_quantized.onnx", "decoder_with_past_model_quantized.onnx"];
+  for (const [ix, file] of parts.entries()) {
+    loader.add(ix, new Uint8Array(await (await fetch(`/${dir}/${file}`)).arrayBuffer()));
+    log(`  loaded ${file}: heap ${heap()} MB`);
+  }
+  const translator = loader.finish(await text("tokenizer.json"));
+  return async (t) => JSON.parse(translator.translate(t));
+}
+
+async function loadOrt(noqdq) {
+  const { pipeline, env } = await import("/vendor/transformers.min.js");
+  env.allowRemoteModels = false;
+  env.allowLocalModels = true;
+  env.localModelPath = "/hub/";
+  env.useBrowserCache = false;
+  env.useWasmCache = false;
+  env.backends.onnx.wasm.wasmPaths = { mjs: "/vendor/ort-wasm-simd-threaded.mjs", wasm: "/vendor/ort-wasm-simd-threaded.wasm" };
+  env.backends.onnx.wasm.numThreads = 1;
+  // `basic`: what chattyness's translate-worker.mjs runs (the extended level rejects these exports).
+  const session_options = { graphOptimizationLevel: "basic" };
+  if (noqdq) session_options.extra = { session: { disable_quant_qdq: "1" } };
+  const p = await pipeline("translation", "Xenova/opus-mt-en-de", { dtype: "q8", device: "wasm", session_options });
+  return async (text) => {
+    const { input_ids, attention_mask } = p.tokenizer(text);
+    const o = await p.model.generate({ input_ids, attention_mask, max_new_tokens: 512, num_beams: 1, do_sample: false });
+    return { text: p.tokenizer.batch_decode(o, { skip_special_tokens: true })[0], tokens: o.dims[1] - 1 };
+  };
+}
+
+try {
+  const t0 = performance.now();
+  const translate = mode === "tract" ? await loadTract() : await loadOrt(mode === "ort-noqdq");
+  const loadMs = Math.round(performance.now() - t0);
+  log(`mode=${location.search} load ${loadMs} ms, heap ${heap()} MB`);
+  const perToken = [];
+  const outputs = {};
+  for (let rep = 0; rep < REPS; rep++) {
+    for (const text of SENTENCES) {
+      const t = performance.now();
+      const r = await translate(text);
+      const ms = performance.now() - t;
+      if (rep > 0) perToken.push(ms / r.tokens);
+      outputs[text] = r.text;
+      log(`${r.tokens} tok ${ms.toFixed(0)} ms ${(ms / r.tokens).toFixed(1)} ms/tok => ${r.text}`);
+    }
+  }
+  perToken.sort((a, b) => a - b);
+  const summary = {
+    mode: location.search,
+    load_ms: loadMs,
+    ms_per_token_median: +perToken[perToken.length >> 1].toFixed(1),
+    heap_peak_mb: heap(),
+    outputs,
+  };
+  log(JSON.stringify(summary));
+} catch (e) {
+  log("ERROR " + (e?.stack ?? e));
+}
+log("DONE");
+</script>
