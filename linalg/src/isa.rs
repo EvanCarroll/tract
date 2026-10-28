@@ -73,6 +73,8 @@ pub enum Isa {
     ArmNeon,
     Aarch64Fp16,
     Aarch64DotProd,
+    /// FEAT_I8MM, the int8 matrix multiplies (`smmla`, `ummla`, `usmmla`) of Armv8.6.
+    Aarch64I8mm,
     Aarch64Sve2,
     Aarch64Sme,
     Aarch64Sme2,
@@ -100,7 +102,7 @@ pub enum Isa {
 }
 
 impl Isa {
-    pub const ALL: [Isa; 27] = [
+    pub const ALL: [Isa; 28] = [
         Isa::Arm,
         Isa::Aarch64,
         Isa::X86_64,
@@ -109,6 +111,7 @@ impl Isa {
         Isa::ArmNeon,
         Isa::Aarch64Fp16,
         Isa::Aarch64DotProd,
+        Isa::Aarch64I8mm,
         Isa::Aarch64Sve2,
         Isa::Aarch64Sme,
         Isa::Aarch64Sme2,
@@ -141,6 +144,7 @@ impl Isa {
             Isa::ArmNeon => "neon",
             Isa::Aarch64Fp16 => "fp16",
             Isa::Aarch64DotProd => "dotprod",
+            Isa::Aarch64I8mm => "i8mm",
             Isa::Aarch64Sve2 => "sve2",
             Isa::Aarch64Sme => "sme",
             Isa::Aarch64Sme2 => "sme2",
@@ -201,7 +205,7 @@ impl Isa {
             // arm: NEON is the armv7 step above bare VFP, and baseline on aarch64 where the
             // ladder continues through the matrix extensions.
             Isa::ArmNeon => 1,
-            Isa::Aarch64Fp16 | Isa::Aarch64DotProd => 2,
+            Isa::Aarch64Fp16 | Isa::Aarch64DotProd | Isa::Aarch64I8mm => 2,
             Isa::Aarch64Sve2 => 3,
             Isa::Aarch64Sme | Isa::Aarch64Sme2 => 4,
             Isa::Aarch64AppleAmx => 5,
@@ -226,6 +230,7 @@ impl Isa {
             Isa::Aarch64
             | Isa::Aarch64Fp16
             | Isa::Aarch64DotProd
+            | Isa::Aarch64I8mm
             | Isa::Aarch64Sve2
             | Isa::Aarch64Sme
             | Isa::Aarch64Sme2

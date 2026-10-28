@@ -113,6 +113,19 @@ MMMExternKernel!(aarch64; arm64simd_mmm_i32_8x8_dot<i32>(8, 8)@(16, 16)
    store(i8)
 );
 
+// SMMLA (FEAT_I8MM) variant: each instruction multiplies a 2x8 block of A by an 8x2 block of
+// B, so both sides are packed with 8 contiguous K per lane. The kernel turns v16..v31 into
+// 2x2 blocks around its K loop and back, so the tile layout every other op sees is the SDOT
+// and SMLAL one. Gated on `tract_arm64_i8mm`, set by build.rs when the assembler can encode
+// `smmla`.
+#[cfg(tract_arm64_i8mm)]
+MMMExternKernel!(aarch64; arm64simd_mmm_i32_8x8_i8mm<i32>(8, 8)@(16, 16)
+   isa(Aarch64I8mm)
+   packing[1] = i8i8 => |k| k.with_packing(crate::pack::PackedI8K4::with_k_group(8, 8), crate::pack::PackedI8K4::with_k_group(8, 8));
+
+   store(i8)
+);
+
 MMMExternKernel!(aarch64; arm64simd_mmm_i32_64x1<i32>(64, 1)@(16, 1)
    packing[1] = i8i8 => |k| k.with_packing(PackedFormat::new(DatumType::I8, 64,16), PackedFormat::new(DatumType::I8, 1, 1));
 

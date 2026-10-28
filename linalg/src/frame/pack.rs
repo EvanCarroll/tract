@@ -1104,23 +1104,24 @@ unsafe fn transpose_4x4_neon_armv7_16(
     }
 }
 
-// K=4-inner packing writer (PackedI8K4 layout), fed in K-OUTER order (same feed
+// K-group-inner packing writer (PackedI8K4 layout), fed in K-OUTER order (same feed
 // as KOutWriter, used by the im2col patchers): for each k, all mn. Within a panel,
-// element (k, local_mn) lands at (k/4)*r*4 + local_mn*4 + (k%4), so consecutive mn
-// for a fixed k are stride-4 stores.
+// element (k, local_mn) lands at (k/g)*r*g + local_mn*g + (k%g), g the K group, so
+// consecutive mn for a fixed k are stride-g stores.
 #[derive(Debug)]
 pub struct KOut4Writer<'p, T>
 where
     T: Copy + std::fmt::Debug,
 {
     base: *mut T,
-    r4: usize,        // r * 4
+    kg: usize,
+    rkg: usize,       // r * kg
     panel_len: usize, // k_aligned * r
     panels: usize,
     panel_width: usize,
     last_panel_width: usize,
-    kb: usize, // k / 4
-    kr: usize, // k % 4
+    kb: usize, // k / kg
+    kr: usize, // k % kg
     panel: usize,
     local_mn: usize,
     _phantom: PhantomData<&'p T>,
@@ -1130,12 +1131,19 @@ impl<'p, T> KOut4Writer<'p, T>
 where
     T: Copy + std::fmt::Debug,
 {
-    pub fn new(base: *mut T, r: usize, panel_len: usize, mn: usize) -> KOut4Writer<'p, T> {
+    pub fn new(
+        base: *mut T,
+        r: usize,
+        kg: usize,
+        panel_len: usize,
+        mn: usize,
+    ) -> KOut4Writer<'p, T> {
         let panels = mn.divceil(r).max(1);
         let last_panel_width = mn - (panels - 1) * r;
         KOut4Writer {
             base,
-            r4: r * 4,
+            kg,
+            rkg: r * kg,
             panel_len,
             panels,
             panel_width: r,
@@ -1160,7 +1168,7 @@ where
             if self.panel == self.panels {
                 self.panel = 0;
                 self.kr += 1;
-                if self.kr == 4 {
+                if self.kr == self.kg {
                     self.kr = 0;
                     self.kb += 1;
                 }
@@ -1176,7 +1184,10 @@ where
     #[inline(always)]
     fn write(&mut self, t: T) {
         unsafe {
-            let off = self.panel * self.panel_len + self.kb * self.r4 + self.local_mn * 4 + self.kr;
+            let off = self.panel * self.panel_len
+                + self.kb * self.rkg
+                + self.local_mn * self.kg
+                + self.kr;
             *self.base.add(off) = t;
         }
         self.advance(1);
@@ -1190,14 +1201,17 @@ where
         }
         let pw = self.panel_width();
         if self.local_mn + n <= pw {
-            // Whole slice stays inside the current (panel, k): tight stride-4 store.
+            // Whole slice stays inside the current (panel, k): tight stride-kg store.
             unsafe {
                 let mut d = self.base.add(
-                    self.panel * self.panel_len + self.kb * self.r4 + self.local_mn * 4 + self.kr,
+                    self.panel * self.panel_len
+                        + self.kb * self.rkg
+                        + self.local_mn * self.kg
+                        + self.kr,
                 );
                 for &t in ts {
                     *d = t;
-                    d = d.add(4);
+                    d = d.add(self.kg);
                 }
             }
             self.advance(n);
@@ -1209,20 +1223,26 @@ where
     }
 }
 
-// K=4-inner packing for SDOT/relaxed-dot int8 matmul: 4 contiguous K per mn-lane.
-// Layout: out[(k/4)*r*4 + m*4 + (k%4)] = src[m,k]. k_alignment=4. Matmul path uses
-// pack_view; the conv im2col patchers feed write_with_k_outer in K-outer order.
+/// K-group-inner packing for int8 matmul: `kg` contiguous K per mn-lane, 4 for the SDOT,
+/// SMOPA and relaxed-dot kernels, 8 for SMMLA, whose operands are two lanes of 8 K each.
+/// Layout: `out[(k/kg)*r*kg + m*kg + (k%kg)] = src[m,k]`, K zero-padded to a multiple of
+/// `kg`, which is also the `k_alignment`. The matmul path uses `pack_view`; the conv im2col
+/// patchers feed `write_with_k_outer` in K-outer order.
 #[derive(Clone, Debug, Hash, PartialEq, Eq)]
 pub struct PackedI8K4 {
     pub r: usize,
     pub align: usize,
+    pub kg: usize,
 }
 impl PackedI8K4 {
     pub fn new(r: usize) -> Self {
-        PackedI8K4 { r, align: 16 }
+        Self::with_k_group(r, 4)
+    }
+    pub fn with_k_group(r: usize, kg: usize) -> Self {
+        PackedI8K4 { r, align: 16, kg }
     }
     fn panel(&self, k: usize) -> usize {
-        (k.div_ceil(4) * 4) * self.r
+        (k.div_ceil(self.kg) * self.kg) * self.r
     }
     pub fn single_panel_len(&self, k: usize) -> usize {
         self.panel(k)
@@ -1240,9 +1260,9 @@ impl PackedI8K4 {
         k: usize,
         mn: usize,
     ) -> KOut4Writer<'p, T> {
-        KOut4Writer::new(pb, self.r, self.panel(k), mn)
+        KOut4Writer::new(pb, self.r, self.kg, self.panel(k), mn)
     }
-    // K=4-inner pack from a (possibly strided) view: out[(k/4)*r*4 + m*4 + (k%4)] = src[m,k].
+    // K-group-inner pack from a (possibly strided) view: out[(k/kg)*r*kg + m*kg + (k%kg)] = src[m,k].
     pub fn pack_view(
         &self,
         t: &TensorView,
@@ -1252,14 +1272,15 @@ impl PackedI8K4 {
         ensure!(k_axis != mn_axis, "k_axis and mn_axis must differ (both are {k_axis})");
         let k = t.shape()[k_axis];
         let mn = t.shape()[mn_axis];
-        let kp = k.div_ceil(4) * 4;
+        let kg = self.kg;
+        let kp = k.div_ceil(kg) * kg;
         let pl = kp * self.r;
         let panels = mn.div_ceil(self.r);
         let st = t.strides();
         let mut blob = unsafe { Blob::new_for_size_and_align(panels * pl, self.align) };
         blob.as_bytes_mut().fill(0);
         let (ks, ms) = (st[k_axis], st[mn_axis]);
-        let kblocks = kp / 4;
+        let kblocks = kp / kg;
         unsafe {
             let src = t.as_ptr_unchecked::<i8>();
             let dst = blob.as_mut_ptr() as *mut i8;
@@ -1268,15 +1289,15 @@ impl PackedI8K4 {
                 let panel = dst.add(p * pl);
                 let mn0 = (p * self.r) as isize;
                 for kb in 0..kblocks {
-                    for kr in 0..4 {
-                        let kk = kb * 4 + kr;
+                    for kr in 0..kg {
+                        let kk = kb * kg + kr;
                         if kk >= k {
                             break;
                         }
                         let srow = src.offset(kk as isize * ks + mn0 * ms);
-                        let dcol = panel.add(kb * self.r * 4 + kr);
+                        let dcol = panel.add(kb * self.r * kg + kr);
                         for lm in 0..pw {
-                            *dcol.add(lm * 4) = *srow.offset(lm as isize * ms);
+                            *dcol.add(lm * kg) = *srow.offset(lm as isize * ms);
                         }
                     }
                 }
@@ -1292,7 +1313,7 @@ impl PackedI8K4 {
 }
 impl std::fmt::Display for PackedI8K4 {
     fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
-        write!(f, "I8K4[{}]", self.r)
+        write!(f, "I8K{}[{}]", self.kg, self.r)
     }
 }
 impl MMMInputFormat for PackedI8K4 {
@@ -1315,13 +1336,15 @@ impl MMMInputFormat for PackedI8K4 {
         self.r
     }
     fn k_alignment(&self) -> usize {
-        4
+        self.kg
     }
     fn merge_with<'o, 'a: 'o, 'b: 'o>(
         &'a self,
         o: &'b dyn MMMInputFormat,
     ) -> Option<&'o dyn MMMInputFormat> {
-        o.downcast_ref::<PackedI8K4>().filter(|x| x.r == self.r).map(|_| self as _)
+        o.downcast_ref::<PackedI8K4>()
+            .filter(|x| x.r == self.r && x.kg == self.kg)
+            .map(|_| self as _)
     }
     fn mem_size(&self, k: TDim, mn: TDim) -> TDim {
         mn.divceil(self.r) * self.panel(k.to_usize().unwrap_or(0))
@@ -1648,6 +1671,7 @@ mod test {
         // true : input tensor is [mn, k] (k_axis=1, mn_axis=0) — strided read,
         //        mirroring how the "A" operand is fed.
         is_a: bool,
+        kg: usize,
     }
 
     impl PackI8K4Problem {
@@ -1659,7 +1683,7 @@ mod test {
         }
 
         fn panel_len(&self) -> usize {
-            (self.k.div_ceil(4) * 4) * self.r
+            (self.k.div_ceil(self.kg) * self.kg) * self.r
         }
 
         // The layout every producer must reproduce.
@@ -1674,7 +1698,8 @@ mod test {
                 for kk in 0..self.k {
                     for lm in 0..pw {
                         let m = p * r + lm;
-                        let off = p * pl + (kk / 4) * r * 4 + lm * 4 + (kk % 4);
+                        let kg = self.kg;
+                        let off = p * pl + (kk / kg) * r * kg + lm * kg + (kk % kg);
                         out[off] = logical[[kk, m]];
                     }
                 }
@@ -1685,7 +1710,7 @@ mod test {
         // The matmul path: pack a TensorView, then read it back panel by panel.
         fn pack_view_bytes(&self) -> Vec<i8> {
             let logical = self.logical();
-            let packer = super::PackedI8K4::new(self.r);
+            let packer = super::PackedI8K4::with_k_group(self.r, self.kg);
             let (tensor, k_axis, mn_axis) = if self.is_a {
                 // [mn, k] with entry [m, kk] == logical[kk, m]; reads are strided.
                 let a = Array2::from_shape_fn((self.mn, self.k), |(m, kk)| logical[[kk, m]]);
@@ -1712,7 +1737,7 @@ mod test {
         // The conv path: feed the writer in K-outer order (for each k, all mn).
         fn writer_bytes(&self) -> Vec<i8> {
             let logical = self.logical();
-            let packer = super::PackedI8K4::new(self.r);
+            let packer = super::PackedI8K4::with_k_group(self.r, self.kg);
             let total = packer.len(self.k, self.mn);
             assert_eq!(total, self.mn.div_ceil(self.r) * self.panel_len());
             let mut buf = vec![0i8; total];
@@ -1747,8 +1772,14 @@ mod test {
         type Strategy = BoxedStrategy<PackI8K4Problem>;
         fn arbitrary_with(_: ()) -> Self::Strategy {
             // r is the tile width used by the int8 kernels (SMOPA 32, SDOT 8, ...).
-            (any::<bool>(), prop::sample::select(vec![4usize, 8, 16, 32]), 1usize..40, 1usize..40)
-                .prop_map(|(is_a, r, k, mn)| PackI8K4Problem { k, mn, r, is_a })
+            (
+                any::<bool>(),
+                prop::sample::select(vec![4usize, 8, 16, 32]),
+                prop::sample::select(vec![4usize, 8]),
+                1usize..40,
+                1usize..40,
+            )
+                .prop_map(|(is_a, r, kg, k, mn)| PackI8K4Problem { k, mn, r, is_a, kg })
                 .boxed()
         }
     }
@@ -1761,7 +1792,19 @@ mod test {
     }
 
     fn k4(k: usize, mn: usize, r: usize, is_a: bool) -> PackI8K4Problem {
-        PackI8K4Problem { k, mn, r, is_a }
+        PackI8K4Problem { k, mn, r, is_a, kg: 4 }
+    }
+
+    fn k8(k: usize, mn: usize, r: usize, is_a: bool) -> PackI8K4Problem {
+        PackI8K4Problem { k, mn, r, is_a, kg: 8 }
+    }
+
+    #[test]
+    fn i8k8_k_and_mn_tails() {
+        for k in [1, 4, 7, 8, 9, 15, 16, 17] {
+            k8(k, 8, 8, false).check();
+            k8(k, 13, 8, true).check();
+        }
     }
 
     #[test]

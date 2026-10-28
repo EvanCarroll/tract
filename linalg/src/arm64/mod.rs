@@ -343,11 +343,33 @@ impl Kind {
     }
 }
 
-/// SDOT (~4x the SMLAL 8x8) when FEAT_DotProd is present, else the SMLAL 8x8 fallback. The SDOT
-/// kernel only exists when the assembler could encode `sdot` (`tract_arm64_dotprod`, set by
-/// build.rs); otherwise always use the SMLAL 8x8.
+/// FEAT_I8MM (SMMLA, Armv8.6): read from the kernel's hardware capabilities, the only place
+/// this build looks for it.
+#[cfg(all(target_os = "linux", target_arch = "aarch64"))]
+pub fn has_i8mm() -> bool {
+    const HWCAP2_I8MM: u64 = 1 << 13;
+    const AT_HWCAP2: u64 = 26;
+    unsafe extern "C" {
+        fn getauxval(t: u64) -> u64;
+    }
+    unsafe { (getauxval(AT_HWCAP2) & HWCAP2_I8MM) != 0 }
+}
+
+#[cfg(not(all(target_os = "linux", target_arch = "aarch64")))]
+pub fn has_i8mm() -> bool {
+    false
+}
+
+/// SMMLA (twice the products per instruction of SDOT) when FEAT_I8MM is present, else SDOT
+/// (~4x the SMLAL 8x8) when FEAT_DotProd is, else the SMLAL 8x8 fallback. The SMMLA and SDOT
+/// kernels only exist when the assembler could encode them (`tract_arm64_i8mm` and
+/// `tract_arm64_dotprod`, set by build.rs).
 fn neon_qmmm_i32(isa: &IsaSet, _suitable: &[Suitable]) -> Option<&'static str> {
     let _ = isa;
+    #[cfg(tract_arm64_i8mm)]
+    if isa.has(Isa::Aarch64I8mm) {
+        return Some(arm64simd_mmm_i32_8x8_i8mm.name.as_str());
+    }
     #[cfg(tract_arm64_dotprod)]
     if isa.has(Isa::Aarch64DotProd) {
         return Some(arm64simd_mmm_i32_8x8_dot.name.as_str());
@@ -508,6 +530,9 @@ pub fn isa_set() -> crate::isa::IsaSet {
     }
     if has_dotprod() {
         set = set.with(Isa::Aarch64DotProd);
+    }
+    if has_i8mm() {
+        set = set.with(Isa::Aarch64I8mm);
     }
     if sve::has_sve2() {
         set = set.with(Isa::Aarch64Sve2);

@@ -68,6 +68,19 @@ fn assembler_supports_dotprod() -> bool {
         .is_ok()
 }
 
+// Probe whether the target assembler can encode FEAT_I8MM `smmla`, used by
+// arm64simd_mmm_i32_8x8_i8mm. When the probe fails we skip that kernel and the
+// `tract_arm64_i8mm` cfg; the runtime falls back to the SDOT or SMLAL i32 kernels.
+fn assembler_supports_i8mm() -> bool {
+    arm64_cc()
+        .file("arm64/arm64simd/dummy_i8mm.S")
+        .cargo_metadata(false)
+        .cargo_warnings(false)
+        .warnings(false)
+        .try_compile("tract_i8mm_probe")
+        .is_ok()
+}
+
 // Probe whether the target assembler can encode ratified RVV 1.0. `.option
 // arch` arrived in binutils 2.36 and the 1.0 encodings in 2.38; anything older
 // either rejects the directive outright or knows only the incompatible 0.7.1
@@ -290,6 +303,8 @@ fn main() {
     println!("cargo:rustc-check-cfg=cfg(tract_sve_fp16)");
     // Set below only when the aarch64 assembler probe for `sdot` passes.
     println!("cargo:rustc-check-cfg=cfg(tract_arm64_dotprod)");
+    // Set below only when the aarch64 assembler probe for `smmla` passes.
+    println!("cargo:rustc-check-cfg=cfg(tract_arm64_i8mm)");
     // Set below only when the x86_64 assembler probe for vpdpbusd ymm passes.
     println!("cargo:rustc-check-cfg=cfg(tract_avx512vnni)");
     // Set below only when the x86_64 assembler accepts AMX int8 mnemonics
@@ -482,7 +497,9 @@ fn main() {
             // encode `sdot` don't break the whole arm64simd build. Remove it
             // from the main file list.
             files.retain(|f| {
-                !f.file_name().and_then(|n| n.to_str()).is_some_and(|n| n.contains("_dot"))
+                !f.file_name()
+                    .and_then(|n| n.to_str())
+                    .is_some_and(|n| n.contains("_dot") || n.contains("_i8mm"))
             });
             arm64_cc().files(files).compile("arm64simd");
             // The template stays in arm64/arm64simd/ (alongside the jinja partials
@@ -494,6 +511,13 @@ fn main() {
                 preprocess_file(tmpl, &out, &[], &suffix, false);
                 arm64_cc().file(&out).compile("arm64simd_dot");
                 println!("cargo:rustc-cfg=tract_arm64_dotprod");
+            }
+            if assembler_supports_i8mm() {
+                let tmpl = path::Path::new("arm64/arm64simd/arm64simd_mmm_i32_8x8_i8mm.S.j2");
+                let out = out_dir.join(format!("arm64simd_mmm_i32_8x8_i8mm_{suffix}.S"));
+                preprocess_file(tmpl, &out, &[], &suffix, false);
+                arm64_cc().file(&out).compile("arm64simd_i8mm");
+                println!("cargo:rustc-cfg=tract_arm64_i8mm");
             }
             if include_amx() {
                 let files = preprocess_files("arm64/apple_amx", &[], &suffix, false);
