@@ -1487,11 +1487,11 @@ const MIN_DIRECT_SPATIAL_W: usize = 128;
 
 /// The most inputs per output point a direct spatial convolution takes: past it, im2col's matrix
 /// product reuses each input load across more output channels than the four `conv_w4` computes.
-const MAX_DIRECT_SPATIAL_K: usize = 64;
+const MAX_DIRECT_SPATIAL_K: usize = usize::MAX;
 
 /// The widest stride along W a direct spatial convolution takes: past it, `conv_w4` gathers or
 /// reads its inputs one point at a time, where im2col packs each input once.
-const MAX_DIRECT_SPATIAL_W_STRIDE: usize = 2;
+const MAX_DIRECT_SPATIAL_W_STRIDE: usize = usize::MAX;
 
 crate::declare_knob!(
     scopable TRACT_DISABLE_DIRECT_SPATIAL,
