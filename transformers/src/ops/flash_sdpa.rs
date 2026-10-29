@@ -1,6 +1,8 @@
 use tract_nnef::internal::*;
 use tract_nnef::prelude::tract_itertools::Itertools;
-use tract_nnef::tract_ndarray::{Array2, Array4, ArrayView2, ArrayView4, ArrayViewMut2, Ix4, s};
+use tract_nnef::tract_ndarray::{
+    Array2, Array4, ArrayView2, ArrayView4, ArrayViewMut2, CowArray, Ix2, Ix4, s,
+};
 
 tract_core::declare_knob!(
     TRACT_FLASH_SDPA_ST,
@@ -140,19 +142,25 @@ impl EvalOp for FlashSdpaOp {
         let k4 = k.to_shape((batch_size, num_kv_heads, kv_len, head_dim))?;
         let v4 = v.to_shape((batch_size, num_kv_heads, kv_len, head_dim))?;
 
-        let m = if let Some(m) = inputs.get(3) {
-            Some(
-                m.cast_to::<f32>()?.into_owned().into_plain_array::<f32>()?.into_shape_with_order(
-                    (m.shape()[0], if m.rank() == 3 { 1 } else { m.shape()[1] }, query_len, kv_len),
-                )?,
-            )
-        } else {
-            None
+        let mask_f32 = inputs
+            .get(3)
+            .filter(|m| m.datum_type() != f16::datum_type())
+            .map(|m| m.cast_to::<f32>())
+            .transpose()?;
+        let mask = match (inputs.get(3), &mask_f32) {
+            (Some(m), Some(m32)) => Some(MaskView::F32(
+                m32.to_plain_array_view::<f32>()?
+                    .into_shape_with_order(mask_shape(m, query_len, kv_len))?,
+            )),
+            (Some(m), None) => Some(MaskView::F16(
+                m.to_plain_array_view::<f16>()?
+                    .into_shape_with_order(mask_shape(m, query_len, kv_len))?,
+            )),
+            _ => None,
         };
 
-        let mut out = self
-            .flash_attention_gqa(q4.view(), k4.view(), v4.view(), m.as_ref().map(|m| m.view()))
-            .into_dyn();
+        let mut out =
+            self.flash_attention_gqa_impl(q4.view(), k4.view(), v4.view(), mask, false).into_dyn();
         if is_3d_case {
             out.index_axis_inplace(tract_ndarray::Axis(1), 0);
         }
@@ -179,7 +187,7 @@ impl FlashSdpaOp {
         v: ArrayView4<f32>,
         mask: Option<ArrayView4<f32>>,
     ) -> Array4<f32> {
-        self.flash_attention_gqa_impl(q, k, v, mask, false)
+        self.flash_attention_gqa_impl(q, k, v, mask.map(MaskView::F32), false)
     }
 
     fn flash_attention_gqa_impl(
@@ -187,7 +195,7 @@ impl FlashSdpaOp {
         q: ArrayView4<f32>,
         k: ArrayView4<f32>,
         v: ArrayView4<f32>,
-        mask: Option<ArrayView4<f32>>,
+        mask: Option<MaskView>,
         pv_strided: bool,
     ) -> Array4<f32> {
         let (batch_size, num_q_heads, q_len, head_dim) = q.dim();
@@ -201,7 +209,9 @@ impl FlashSdpaOp {
         let tasks: Vec<(usize, usize)> =
             (0..batch_size).flat_map(|b| (0..num_q_heads).map(move |qh| (b, qh))).collect();
         let compute = |&(b, qh): &(usize, usize)| {
-            self.attend_one_head(b, qh, qh / group_size, q, k, v, mask.as_ref(), pv_strided)
+            let mask = mask.as_ref().map(|m| m.head(b, qh));
+            let mask = mask.as_ref().map(|m| m.view());
+            self.attend_one_head(b, qh, qh / group_size, q, k, v, mask, pv_strided)
         };
 
         let results: Vec<Array2<f32>> = if Self::should_thread(tasks.len()) {
@@ -242,7 +252,7 @@ impl FlashSdpaOp {
         q: ArrayView4<f32>,
         k: ArrayView4<f32>,
         v: ArrayView4<f32>,
-        mask: Option<&ArrayView4<f32>>,
+        mask: Option<ArrayView2<f32>>,
         pv_strided: bool,
     ) -> Array2<f32> {
         let (_, _, q_len, head_dim) = q.dim();
@@ -251,9 +261,6 @@ impl FlashSdpaOp {
 
         let block_kv_len = 32;
         let block_q_len = 32;
-
-        let mb = b.min(mask.map(|m| m.shape()[0] - 1).unwrap_or(0));
-        let mh = qh.min(mask.map(|m| m.shape()[1] - 1).unwrap_or(0));
 
         let mut out = Array2::<f32>::zeros((q_len, head_dim));
         let mut l = vec![0f32; q_len];
@@ -264,7 +271,7 @@ impl FlashSdpaOp {
                 let q_range = (qbix * block_q_len)..((qbix + 1) * block_q_len).min(q_len);
                 if let Some(mask) = mask
                     && mask
-                        .slice(s!(mb, mh, q_range.clone(), kv_range.clone()))
+                        .slice(s!(q_range.clone(), kv_range.clone()))
                         .iter()
                         .all(|x| *x < -65503.0)
                 {
@@ -279,7 +286,7 @@ impl FlashSdpaOp {
                 // Sij <- QiKTj
                 let mut s = qblock.dot(&kblock.t()) * scale;
                 if let Some(mask) = mask {
-                    s += &mask.slice(s!(mb, mh, q_range.clone(), kv_range.clone()));
+                    s += &mask.slice(s!(q_range.clone(), kv_range.clone()));
                 } else if self.causal {
                     let mask =
                         Array2::from_elem((q_range.len(), kv_range.len()), f32::NEG_INFINITY);
@@ -336,6 +343,36 @@ impl FlashSdpaOp {
             }
         }
         out
+    }
+}
+
+/// `mask`'s 4-D shape: a rank-3 mask has one head that every head shares.
+fn mask_shape(mask: &Tensor, q_len: usize, kv_len: usize) -> (usize, usize, usize, usize) {
+    let heads = if mask.rank() == 3 { 1 } else { mask.shape()[1] };
+    (mask.shape()[0], heads, q_len, kv_len)
+}
+
+/// The additive mask, in f32 or still in f16: each head's `[q_len, kv_len]`
+/// slice is widened by the task attending that head, so an f16 mask is never
+/// converted whole. Batch and head axes of length 1 broadcast.
+#[derive(Clone, Copy)]
+enum MaskView<'a> {
+    F32(ArrayView4<'a, f32>),
+    F16(ArrayView4<'a, f16>),
+}
+
+impl MaskView<'_> {
+    fn head(&self, b: usize, qh: usize) -> CowArray<'_, f32, Ix2> {
+        match self {
+            MaskView::F32(m) => {
+                let (mb, mh) = (b.min(m.shape()[0] - 1), qh.min(m.shape()[1] - 1));
+                m.slice(s!(mb, mh, .., ..)).into()
+            }
+            MaskView::F16(m) => {
+                let (mb, mh) = (b.min(m.shape()[0] - 1), qh.min(m.shape()[1] - 1));
+                m.slice(s!(mb, mh, .., ..)).mapv(f16::to_f32).into()
+            }
+        }
     }
 }
 
@@ -437,6 +474,34 @@ mod tests {
             got.iter().zip(via_f16.iter()).map(|(x, y)| (x - y).abs()).fold(0f32, f32::max);
         ensure!(max_abs < 5e-3, "f16 flash eval diverges from f32: {max_abs}");
         Ok(())
+    }
+
+    #[test]
+    fn flash_sdpa_f16_mask_matches_f32_mask() -> TractResult<()> {
+        let (b, h, sq, sk, d) = (2usize, 3, 40, 37, 8);
+        let q = Tensor::from_shape(&[b, h, sq, d], &rng(b * h * sq * d, 7))?;
+        let k = Tensor::from_shape(&[b, h, sk, d], &rng(b * h * sk * d, 8))?;
+        let v = Tensor::from_shape(&[b, h, sk, d], &rng(b * h * sk * d, 9))?;
+        let mask16 = Tensor::from_shape(&[1, h, sq, sk], &rng(h * sq * sk, 10))?
+            .cast_to::<f16>()?
+            .into_owned();
+        let mask32 = mask16.cast_to::<f32>()?.into_owned();
+        let op = FlashSdpaOp { causal: false, scale: None };
+        let run = |mask: &Tensor| -> TractResult<Tensor> {
+            Ok(op
+                .eval(
+                    &EvalContext::out_of_plan(),
+                    tvec!(
+                        q.clone().into_tvalue(),
+                        k.clone().into_tvalue(),
+                        v.clone().into_tvalue(),
+                        mask.clone().into_tvalue()
+                    ),
+                )?
+                .remove(0)
+                .into_tensor())
+        };
+        run(&mask32)?.close_enough(&run(&mask16)?, Approximation::Exact)
     }
 
     // A/B the P·V step (tile GEMM vs strided per-column dot) across the microbench
