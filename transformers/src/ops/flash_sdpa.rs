@@ -12,6 +12,10 @@ tract_core::declare_knob!(
     "Force single-threaded flash SDPA (disable per-head rayon parallelism)."
 );
 
+/// Longest K/V sequence attended as a single tile, its softmax taken in one pass
+/// rather than rescaled block by block.
+const ONE_TILE_MAX_KV_LEN: usize = 256;
+
 /// Tract operator wrapper.
 #[derive(Clone, Debug, PartialEq)]
 pub struct FlashSdpaOp {
@@ -234,7 +238,7 @@ impl FlashSdpaOp {
         let kv_len = k.dim().0;
         let scale = self.scale.unwrap_or((head_dim as f32).recip().sqrt());
 
-        let block_kv_len = 32;
+        let block_kv_len = if kv_len <= ONE_TILE_MAX_KV_LEN { kv_len.max(1) } else { 32 };
         let block_q_len = 32;
 
         let mut out = Array2::<f32>::zeros((q_len, head_dim));
