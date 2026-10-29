@@ -1,6 +1,7 @@
 use crate::internal::*;
 use crate::ops::binary::TypedBinOp;
 use crate::ops::math::{Add, Mul};
+use tract_data::half::slice::HalfFloatSliceExt;
 use tract_linalg::routines::Func;
 
 const CHUNK: usize = 1024;
@@ -9,20 +10,35 @@ fn inv_sqrt2() -> f32 {
     (2.0f32).sqrt().recip()
 }
 
+/// Rounds each of `xs` to the nearest f16, as one f16 operation would, through
+/// `scratch` (as long as `xs`).
+fn round_to_f16(xs: &mut [f32], scratch: &mut [f16]) {
+    scratch.convert_from_f32_slice(xs);
+    scratch.convert_to_f32_slice(xs);
+}
+
 crate::element_wise!(gelu_exact, GeluExact,
     [f16] => |_, xs| {
         let erf = Func::Erf.ew_f32()?;
-        let c = f16::from_f32(inv_sqrt2());
-        let half = f16::from_f32(0.5);
-        let one = f16::from_f32(1.0);
+        let c = f16::from_f32(inv_sqrt2()).to_f32();
+        let mut wide = vec![0f32; xs.len().min(CHUNK)];
         let mut scratch = vec![0f32; xs.len().min(CHUNK)];
+        let mut narrow = vec![f16::ZERO; xs.len().min(CHUNK)];
         for chunk in xs.chunks_mut(CHUNK) {
-            let scaled = &mut scratch[..chunk.len()];
-            scaled.iter_mut().zip(chunk.iter()).for_each(|(s, x)| *s = (*x * c).to_f32());
-            erf.run(scaled)?;
-            chunk.iter_mut().zip(scaled.iter()).for_each(|(x, e)| {
-                *x = (*x * half) * (f16::from_f32(*e) + one);
-            });
+            let x = &mut wide[..chunk.len()];
+            let e = &mut scratch[..chunk.len()];
+            let narrow = &mut narrow[..chunk.len()];
+            chunk.convert_to_f32_slice(x);
+            e.iter_mut().zip(x.iter()).for_each(|(e, x)| *e = *x * c);
+            round_to_f16(e, narrow);
+            erf.run(e)?;
+            round_to_f16(e, narrow);
+            e.iter_mut().for_each(|e| *e += 1.0);
+            round_to_f16(e, narrow);
+            x.iter_mut().for_each(|x| *x *= 0.5);
+            round_to_f16(x, narrow);
+            x.iter_mut().zip(e.iter()).for_each(|(x, e)| *x *= *e);
+            chunk.convert_from_f32_slice(x);
         }
         Ok(())
     },
