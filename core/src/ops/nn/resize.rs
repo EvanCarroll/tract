@@ -1,5 +1,6 @@
 use crate::internal::*;
 use crate::ops::array::MultiBroadcastTo;
+use tract_num_traits::AsPrimitive;
 
 /// Maps an output coordinate back to the input axis. The ONNX coordinate
 /// transformation modes that have a well-defined inverse without an input ROI.
@@ -419,25 +420,71 @@ impl EvalOp for Resize {
             output_shape.iter().zip(inputs[0].shape()).map(|(o, i)| *o as f32 / *i as f32).collect()
         };
         let input = inputs.remove(0).into_tensor();
-        let input = input.cast_to::<f32>()?;
-        let mut shape: TVec<usize> = input.shape().into();
-        let mut data: Vec<f32> = input.try_as_plain_ram()?.as_slice::<f32>()?.to_vec();
-        for (axis, scale) in scales.into_iter().enumerate() {
-            let (len_in, len_out) = (shape[axis], output_shape[axis]);
-            if len_in == len_out && scale == 1.0 {
-                continue;
-            }
-            let plan = self.plan_axis(scale, len_in, len_out);
-            let mut resampled = vec![0f32; data.len() / len_in * len_out];
-            resample_axis(&data, &shape, axis, &plan, 0.0, &mut resampled);
-            data = resampled;
-            shape[axis] = len_out;
+        let plans: TVec<(usize, AxisPlan)> = scales
+            .into_iter()
+            .enumerate()
+            .filter(|&(axis, scale)| input.shape()[axis] != output_shape[axis] || scale != 1.0)
+            .map(|(axis, scale)| {
+                (axis, self.plan_axis(scale, input.shape()[axis], output_shape[axis]))
+            })
+            .collect();
+        if plans.is_empty() {
+            return Ok(tvec!(input.into_tvalue()));
         }
-        let out = tract_ndarray::ArrayD::from_shape_vec(&*shape, data)?.into_tensor();
-        let out =
-            if out.datum_type() == input_dt { out } else { out.cast_to_dt(input_dt)?.into_owned() };
+        let out = match input_dt {
+            DatumType::F16 => resample_planes::<f16>(&input, &output_shape, &plans)?,
+            DatumType::F32 => resample_planes::<f32>(&input, &output_shape, &plans)?,
+            _ => resample_planes::<f32>(&*input.cast_to::<f32>()?, &output_shape, &plans)?
+                .cast_to_dt(input_dt)?
+                .into_owned(),
+        };
         Ok(tvec!(out.into_tvalue()))
     }
+}
+
+/// Applies `plans` (axis, plan), in order, to `input`. The axes before the first
+/// planned one are untouched, so each index of them is an independent plane,
+/// resampled in f32 on its own and spread across the executor's threads.
+fn resample_planes<T: Datum + Copy + AsPrimitive<f32>>(
+    input: &Tensor,
+    output_shape: &[usize],
+    plans: &[(usize, AxisPlan)],
+) -> TractResult<Tensor>
+where
+    f32: AsPrimitive<T>,
+{
+    let first = plans[0].0;
+    let plain = input.try_as_plain_ram()?;
+    let src = plain.as_slice::<T>()?;
+    let in_plane: usize = input.shape()[first..].iter().product();
+    let out_plane: usize = output_shape[first..].iter().product();
+    let mut output = Tensor::zero_dt(T::datum_type(), output_shape)?;
+    if in_plane == 0 || out_plane == 0 {
+        return Ok(output);
+    }
+    {
+        let mut out_plain = output.try_as_plain_ram_mut()?;
+        let dst = out_plain.as_slice_mut::<T>()?;
+        let total = dst.len();
+        tract_linalg::multithread::par_chunks_mut(dst, out_plane, total, |first_plane, chunk| {
+            for (p, out) in chunk.chunks_exact_mut(out_plane).enumerate() {
+                let mut shape: TVec<usize> = input.shape()[first..].into();
+                let plane = &src[(first_plane + p) * in_plane..][..in_plane];
+                let mut data: Vec<f32> = plane.iter().map(|x| x.as_()).collect();
+                for (axis, plan) in plans {
+                    let axis = axis - first;
+                    let len_out = plan.extrapolated.len();
+                    let mut resampled = vec![0f32; data.len() / shape[axis] * len_out];
+                    resample_axis(&data, &shape, axis, plan, 0.0, &mut resampled);
+                    data = resampled;
+                    shape[axis] = len_out;
+                }
+                out.iter_mut().zip(&data).for_each(|(o, d)| *o = d.as_());
+            }
+            Ok(())
+        })?;
+    }
+    Ok(output)
 }
 
 impl TypedOp for Resize {
