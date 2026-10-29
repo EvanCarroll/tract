@@ -1,7 +1,8 @@
 use tract_nnef::internal::*;
 use tract_nnef::prelude::tract_itertools::Itertools;
+use tract_nnef::tract_core::tract_data::half::slice::HalfFloatSliceExt;
 use tract_nnef::tract_ndarray::{
-    Array2, Array4, ArrayView2, ArrayView4, ArrayViewMut2, CowArray, Ix2, Ix4, s,
+    Array2, Array4, ArrayView2, ArrayView4, ArrayViewMut2, CowArray, Ix2, s,
 };
 
 tract_core::declare_knob!(
@@ -102,65 +103,34 @@ impl EvalOp for FlashSdpaOp {
 
     fn eval(&self, _ctx: &EvalContext, inputs: TVec<TValue>) -> TractResult<TVec<TValue>> {
         ensure!(inputs.len() == 3 || inputs.len() == 4);
-        let [q, k, v] = &inputs[0..3] else {
-            bail!("Expects 3 or 4 inptus (Q, K, V, optional mask)")
-        };
+        let q = &inputs[0];
 
         let input_dt = q.datum_type();
+        let is_3d_case = q.rank() == 3;
+        let widened: TVec<Option<Tensor>> = inputs
+            .iter()
+            .map(|t| {
+                (t.datum_type() != f16::datum_type() && t.datum_type() != f32::datum_type())
+                    .then(|| Ok(t.cast_to::<f32>()?.into_owned()))
+                    .transpose()
+            })
+            .collect::<TractResult<_>>()?;
+        let views: TVec<FloatView> = inputs
+            .iter()
+            .zip(&widened)
+            .map(|(t, w)| FloatView::of(w.as_ref().unwrap_or(t)))
+            .collect::<TractResult<_>>()?;
+        let (q, k, v) = (views[0], views[1], views[2]);
 
-        let (q, k, v) = (q.cast_to::<f32>()?, k.cast_to::<f32>()?, v.cast_to::<f32>()?);
-        let mut q = q.to_plain_array_view::<f32>()?;
-        let mut k = k.to_plain_array_view::<f32>()?;
-        let mut v = v.to_plain_array_view::<f32>()?;
-
-        let is_3d_case = q.ndim() == 3;
-
-        if is_3d_case {
-            q.insert_axis_inplace(tract_ndarray::Axis(1));
-            k.insert_axis_inplace(tract_ndarray::Axis(1));
-            v.insert_axis_inplace(tract_ndarray::Axis(1));
-        }
-
-        let (q, k, v) = (
-            q.into_dimensionality::<Ix4>()?,
-            k.into_dimensionality::<Ix4>()?,
-            v.into_dimensionality::<Ix4>()?,
-        );
-
-        let (batch_size, num_q_heads, query_len, head_dim) =
-            (q.shape()[0], q.shape()[1], q.shape()[2], q.shape()[3]);
-        let (bk, num_kv_heads, kv_len, hd_k) =
-            (k.shape()[0], k.shape()[1], k.shape()[2], k.shape()[3]);
-
+        let [batch_size, _, _, head_dim] = q.shape();
+        let [bk, num_kv_heads, kv_len, hd_k] = k.shape();
         ensure!(batch_size == bk, "Batch mismatch between Q and K");
         ensure!(head_dim == hd_k, "Head dim mismatch between Q and K");
         ensure!(num_kv_heads == v.shape()[1], "K/V head mismatch");
         ensure!(kv_len == v.shape()[2] && head_dim == v.shape()[3], "K/V shape mismatch");
 
-        // Views as fixed 4-D
-        let q4 = q.to_shape((batch_size, num_q_heads, query_len, head_dim))?;
-        let k4 = k.to_shape((batch_size, num_kv_heads, kv_len, head_dim))?;
-        let v4 = v.to_shape((batch_size, num_kv_heads, kv_len, head_dim))?;
-
-        let mask_f32 = inputs
-            .get(3)
-            .filter(|m| m.datum_type() != f16::datum_type())
-            .map(|m| m.cast_to::<f32>())
-            .transpose()?;
-        let mask = match (inputs.get(3), &mask_f32) {
-            (Some(m), Some(m32)) => Some(MaskView::F32(
-                m32.to_plain_array_view::<f32>()?
-                    .into_shape_with_order(mask_shape(m, query_len, kv_len))?,
-            )),
-            (Some(m), None) => Some(MaskView::F16(
-                m.to_plain_array_view::<f16>()?
-                    .into_shape_with_order(mask_shape(m, query_len, kv_len))?,
-            )),
-            _ => None,
-        };
-
         let mut out =
-            self.flash_attention_gqa_impl(q4.view(), k4.view(), v4.view(), mask, false).into_dyn();
+            self.flash_attention_gqa_impl(q, k, v, views.get(3).copied(), false).into_dyn();
         if is_3d_case {
             out.index_axis_inplace(tract_ndarray::Axis(1), 0);
         }
@@ -187,19 +157,25 @@ impl FlashSdpaOp {
         v: ArrayView4<f32>,
         mask: Option<ArrayView4<f32>>,
     ) -> Array4<f32> {
-        self.flash_attention_gqa_impl(q, k, v, mask.map(MaskView::F32), false)
+        self.flash_attention_gqa_impl(
+            FloatView::F32(q),
+            FloatView::F32(k),
+            FloatView::F32(v),
+            mask.map(FloatView::F32),
+            false,
+        )
     }
 
     fn flash_attention_gqa_impl(
         &self,
-        q: ArrayView4<f32>,
-        k: ArrayView4<f32>,
-        v: ArrayView4<f32>,
-        mask: Option<MaskView>,
+        q: FloatView,
+        k: FloatView,
+        v: FloatView,
+        mask: Option<FloatView>,
         pv_strided: bool,
     ) -> Array4<f32> {
-        let (batch_size, num_q_heads, q_len, head_dim) = q.dim();
-        let (_, num_kv_heads, _, _) = k.dim();
+        let [batch_size, num_q_heads, q_len, head_dim] = q.shape();
+        let num_kv_heads = k.shape()[1];
         let group_size = num_q_heads / num_kv_heads;
 
         let mut out = Array4::<f32>::zeros((batch_size, num_q_heads, q_len, head_dim));
@@ -209,9 +185,11 @@ impl FlashSdpaOp {
         let tasks: Vec<(usize, usize)> =
             (0..batch_size).flat_map(|b| (0..num_q_heads).map(move |qh| (b, qh))).collect();
         let compute = |&(b, qh): &(usize, usize)| {
+            let kvh = qh / group_size;
+            let (qs, ks, vs) = (q.head(b, qh), k.head(b, kvh), v.head(b, kvh));
             let mask = mask.as_ref().map(|m| m.head(b, qh));
             let mask = mask.as_ref().map(|m| m.view());
-            self.attend_one_head(b, qh, qh / group_size, q, k, v, mask, pv_strided)
+            self.attend_one_head(qs.view(), ks.view(), vs.view(), mask, pv_strided)
         };
 
         let results: Vec<Array2<f32>> = if Self::should_thread(tasks.len()) {
@@ -240,23 +218,20 @@ impl FlashSdpaOp {
         num_tasks > 1 && cfg!(not(target_family = "wasm")) && !TRACT_FLASH_SDPA_ST.get()
     }
 
-    /// Flash-attention for a single (batch, q-head) pair. Returns O of shape
-    /// `[q_len, head_dim]`. Pure function of the read-only Q/K/V/mask views, so it
-    /// is safe to call concurrently for distinct heads.
-    #[allow(clippy::too_many_arguments)]
+    /// Flash-attention for a single (batch, q-head) pair, given that head's
+    /// `[q_len, head_dim]` Q, `[kv_len, head_dim]` K and V, and `[q_len, kv_len]`
+    /// mask. Returns O of shape `[q_len, head_dim]`. Pure function of its read-only
+    /// views, so it is safe to call concurrently for distinct heads.
     fn attend_one_head(
         &self,
-        b: usize,
-        qh: usize,
-        kvh: usize,
-        q: ArrayView4<f32>,
-        k: ArrayView4<f32>,
-        v: ArrayView4<f32>,
+        q: ArrayView2<f32>,
+        k: ArrayView2<f32>,
+        v: ArrayView2<f32>,
         mask: Option<ArrayView2<f32>>,
         pv_strided: bool,
     ) -> Array2<f32> {
-        let (_, _, q_len, head_dim) = q.dim();
-        let kv_len = k.dim().2;
+        let (q_len, head_dim) = q.dim();
+        let kv_len = k.dim().0;
         let scale = self.scale.unwrap_or((head_dim as f32).recip().sqrt());
 
         let block_kv_len = 32;
@@ -279,9 +254,9 @@ impl FlashSdpaOp {
                 }
                 let m = &mut m[q_range.clone()];
                 let l = &mut l[q_range.clone()];
-                let qblock: ArrayView2<f32> = q.slice(s!(b, qh, q_range.clone(), ..));
-                let kblock: ArrayView2<f32> = k.slice(s!(b, kvh, kv_range.clone(), ..));
-                let vblock: ArrayView2<f32> = v.slice(s!(b, kvh, kv_range.clone(), ..));
+                let qblock: ArrayView2<f32> = q.slice(s!(q_range.clone(), ..));
+                let kblock: ArrayView2<f32> = k.slice(s!(kv_range.clone(), ..));
+                let vblock: ArrayView2<f32> = v.slice(s!(kv_range.clone(), ..));
                 let mut oblock: ArrayViewMut2<f32> = out.slice_mut(s!(q_range.clone(), ..));
                 // Sij <- QiKTj
                 let mut s = qblock.dot(&kblock.t()) * scale;
@@ -346,31 +321,52 @@ impl FlashSdpaOp {
     }
 }
 
-/// `mask`'s 4-D shape: a rank-3 mask has one head that every head shares.
-fn mask_shape(mask: &Tensor, q_len: usize, kv_len: usize) -> (usize, usize, usize, usize) {
-    let heads = if mask.rank() == 3 { 1 } else { mask.shape()[1] };
-    (mask.shape()[0], heads, q_len, kv_len)
-}
-
-/// The additive mask, in f32 or still in f16: each head's `[q_len, kv_len]`
-/// slice is widened by the task attending that head, so an f16 mask is never
-/// converted whole. Batch and head axes of length 1 broadcast.
+/// A 4-D Q, K, V or mask operand, in f32 or still in f16: each head's trailing
+/// 2-D slice is widened by the task attending that head, so an f16 operand is
+/// never converted whole. A rank-3 operand gets a head axis of 1; batch and
+/// head axes of length 1 broadcast.
 #[derive(Clone, Copy)]
-enum MaskView<'a> {
+enum FloatView<'a> {
     F32(ArrayView4<'a, f32>),
     F16(ArrayView4<'a, f16>),
 }
 
-impl MaskView<'_> {
-    fn head(&self, b: usize, qh: usize) -> CowArray<'_, f32, Ix2> {
+impl<'a> FloatView<'a> {
+    fn of(t: &'a Tensor) -> TractResult<Self> {
+        let s = t.shape();
+        let shape = match *s {
+            [b, x, y] => (b, 1, x, y),
+            [b, h, x, y] => (b, h, x, y),
+            _ => bail!("FlashSDPA operands have rank 3 or 4, got {s:?}"),
+        };
+        Ok(if t.datum_type() == f16::datum_type() {
+            FloatView::F16(t.to_plain_array_view::<f16>()?.into_shape_with_order(shape)?)
+        } else {
+            FloatView::F32(t.to_plain_array_view::<f32>()?.into_shape_with_order(shape)?)
+        })
+    }
+
+    fn shape(&self) -> [usize; 4] {
+        let s = match self {
+            FloatView::F32(t) => t.shape(),
+            FloatView::F16(t) => t.shape(),
+        };
+        [s[0], s[1], s[2], s[3]]
+    }
+
+    fn head(&self, b: usize, h: usize) -> CowArray<'a, f32, Ix2> {
+        let [nb, nh, _, _] = self.shape();
+        let (b, h) = (b.min(nb - 1), h.min(nh - 1));
         match self {
-            MaskView::F32(m) => {
-                let (mb, mh) = (b.min(m.shape()[0] - 1), qh.min(m.shape()[1] - 1));
-                m.slice(s!(mb, mh, .., ..)).into()
-            }
-            MaskView::F16(m) => {
-                let (mb, mh) = (b.min(m.shape()[0] - 1), qh.min(m.shape()[1] - 1));
-                m.slice(s!(mb, mh, .., ..)).mapv(f16::to_f32).into()
+            FloatView::F32(t) => t.slice_move(s!(b, h, .., ..)).into(),
+            FloatView::F16(t) => {
+                let head = t.slice_move(s!(b, h, .., ..));
+                let mut wide = Array2::<f32>::zeros(head.dim());
+                match (head.as_slice(), wide.as_slice_mut()) {
+                    (Some(src), Some(dst)) => src.convert_to_f32_slice(dst),
+                    _ => wide.zip_mut_with(&head, |w, x| *w = x.to_f32()),
+                }
+                wide.into()
             }
         }
     }
@@ -532,9 +528,9 @@ mod tests {
             let bench = |strided: bool| -> f64 {
                 for _ in 0..2 {
                     std::hint::black_box(op.flash_attention_gqa_impl(
-                        q.view(),
-                        k.view(),
-                        v.view(),
+                        FloatView::F32(q.view()),
+                        FloatView::F32(k.view()),
+                        FloatView::F32(v.view()),
                         None,
                         strided,
                     ));
@@ -544,9 +540,9 @@ mod tests {
                     let t = Instant::now();
                     for _ in 0..3 {
                         std::hint::black_box(op.flash_attention_gqa_impl(
-                            q.view(),
-                            k.view(),
-                            v.view(),
+                            FloatView::F32(q.view()),
+                            FloatView::F32(k.view()),
+                            FloatView::F32(v.view()),
                             None,
                             strided,
                         ));
