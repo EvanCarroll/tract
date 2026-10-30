@@ -243,7 +243,7 @@ impl OpState for InPlaceKvSdpaState {
             inputs.get(3).map(|m| mask_as_4d(m, qv.shape()[2], kview.shape()[2])).transpose()?;
 
         let flash = FlashSdpaOp { causal: self.causal, scale: self.scale };
-        let o = flash.flash_attention_gqa(qv, kview, vview, mask.as_ref().map(|m| m.view()));
+        let o = flash.flash_attention_gqa(qv, kview, vview, mask.as_ref().map(|m| m.view()))?;
 
         Ok(tvec!(o.into_tensor().cast_to_dt(input_dt)?.into_owned().into_tvalue()))
     }

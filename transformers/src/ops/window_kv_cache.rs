@@ -222,7 +222,7 @@ impl OpState for WindowKvSdpaState {
         // The ring buffer already bounds which keys are visible (the last `window`), so
         // attention is "attend all" — every cached key is within the current query's window.
         let flash = FlashSdpaOp { causal: false, scale: self.scale };
-        let o = flash.flash_attention_gqa(qv, kview, vview, None);
+        let o = flash.flash_attention_gqa(qv, kview, vview, None)?;
         Ok(tvec!(o.into_tensor().cast_to_dt(input_dt)?.into_owned().into_tvalue()))
     }
 
