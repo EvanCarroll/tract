@@ -7,6 +7,7 @@ use tract_linalg::pack::{PackedFormat, PackedI8K4, PackingWriter};
 use crate::internal::*;
 use ndarray::prelude::*;
 use num_integer::Integer;
+use std::ops::Range;
 
 use crate::ops::cnn::pools::{ConcretePoolGeometry, PoolGeometry};
 use crate::ops::cnn::{GeometryBound, PoolSpec, ResolveTo};
@@ -189,25 +190,38 @@ impl EvalOp for Im2Col {
                 .collect::<TractResult<Vec<Tensor>>>()?;
             if n > 0 {
                 let work = buffers.len() * n * geometry.k;
-                tract_linalg::multithread::par_chunks_mut(
-                    &mut buffers,
-                    1,
-                    work,
-                    |first, chunk| {
-                        for (ix, data) in (first..).zip(chunk.iter_mut()) {
-                            let input = input.view_at_prefix(&[ix / n_groups])?;
-                            dispatch_copy_by_size!(Patcher::patch(dt)(
-                                &geometry.patcher,
-                                &geometry,
-                                &input,
-                                &mut data.view_mut(),
-                                ix % n_groups,
-                                pad_value
-                            ))?;
-                        }
-                        Ok(())
-                    },
-                )?;
+                let output_y = geometry.pool.patch.output_shape[0];
+                let row_len = n / output_y;
+                let blocks = geometry.patcher.row_blocks(output_y, row_len, r);
+                let mut tasks = vec![];
+                for (ix, data) in buffers.iter_mut().enumerate() {
+                    let mut rest = data.as_bytes_mut();
+                    for rows in &blocks {
+                        let panels = if rows.end == output_y {
+                            n.divceil(r) - rows.start * row_len / r
+                        } else {
+                            rows.len() * row_len / r
+                        };
+                        let (block, tail) = rest.split_at_mut(panels * panel_bytes);
+                        rest = tail;
+                        tasks.push((ix, rows.clone(), block));
+                    }
+                }
+                tract_linalg::multithread::par_chunks_mut(&mut tasks, 1, work, |_, chunk| {
+                    for (ix, rows, block) in chunk.iter_mut() {
+                        let input = input.view_at_prefix(&[*ix / n_groups])?;
+                        dispatch_copy_by_size!(Patcher::patch(dt)(
+                            &geometry.patcher,
+                            &geometry,
+                            &input,
+                            block,
+                            rows.clone(),
+                            *ix % n_groups,
+                            pad_value
+                        ))?;
+                    }
+                    Ok(())
+                })?;
             }
             let values = buffers
                 .into_iter()
@@ -282,24 +296,45 @@ enum Patcher {
 }
 
 impl Patcher {
-    fn patch<'p, T: Copy + Datum + num_traits::Zero>(
+    /// Output-row ranges to pack separately: about eight per input for the 2-D
+    /// patchers, each starting on a panel boundary, else every row at once.
+    fn row_blocks(&self, output_y: usize, output_x: usize, r: usize) -> Vec<Range<usize>> {
+        let step = r / num_integer::gcd(output_x.max(1), r);
+        if !matches!(self, Patcher::Valid2d | Patcher::Padded2d) || output_y <= step {
+            return std::iter::once(0..output_y).collect();
+        }
+        let rows = output_y.divceil(8).next_multiple_of(step);
+        (0..output_y).step_by(rows).map(|y| y..(y + rows).min(output_y)).collect()
+    }
+
+    /// Packs output rows `rows` of group `g` into `pack`, the bytes of the panels
+    /// those rows start in through the panels they end in.
+    #[allow(clippy::too_many_arguments)]
+    fn patch<T: Copy + Datum + num_traits::Zero>(
         &self,
-        geo: &'p ConcreteGeometry,
+        geo: &ConcreteGeometry,
         input: &TensorView,
-        pack: &'p mut TensorView,
+        pack: &mut [u8],
+        rows: Range<usize>,
         g: usize,
         pad_value: Option<&Tensor>,
     ) -> TractResult<()> {
         // Pick the packing writer for the kernel's output format, then run the
         // (writer-generic) patcher. PackedFormat keeps the K-major fast path;
         // PackedI8K4 writes the SMOPA K=4-inner layout in the same single pass.
-        let ptr = unsafe { pack.as_slice_mut_unchecked::<T>().as_mut_ptr() };
+        let ptr = pack.as_mut_ptr() as *mut T;
+        let output_y = geo.pool.patch.output_shape[0];
+        let mn = if rows.end == output_y {
+            geo.n - rows.start * (geo.n / output_y)
+        } else {
+            rows.len() * (geo.n / output_y)
+        };
         if let Some(pf) = geo.out_format.downcast_ref::<PackedFormat>() {
-            let mut w = pf.write_with_k_outer(ptr, geo.k, geo.n);
-            self.run::<T, _>(geo, input, g, pad_value, &mut w)
+            let mut w = pf.write_with_k_outer(ptr, geo.k, mn);
+            self.run::<T, _>(geo, input, rows, g, pad_value, &mut w)
         } else if let Some(p4) = geo.out_format.downcast_ref::<PackedI8K4>() {
-            let mut w = p4.write_with_k_outer(ptr, geo.k, geo.n);
-            self.run::<T, _>(geo, input, g, pad_value, &mut w)
+            let mut w = p4.write_with_k_outer(ptr, geo.k, mn);
+            self.run::<T, _>(geo, input, rows, g, pad_value, &mut w)
         } else {
             bail!("Im2Col: unsupported packing format {:?}", geo.out_format)
         }
@@ -309,13 +344,14 @@ impl Patcher {
         &self,
         geo: &ConcreteGeometry,
         input: &TensorView,
+        rows: Range<usize>,
         g: usize,
         pad_value: Option<&Tensor>,
         writer: &mut W,
     ) -> TractResult<()> {
         match self {
             Patcher::Valid1d => Self::valid_1d::<T, W>(geo, input, g, writer),
-            Patcher::Valid2d => Self::valid_2d::<T, W>(geo, input, g, writer),
+            Patcher::Valid2d => Self::valid_2d::<T, W>(geo, input, rows, g, writer),
             Patcher::Padded1d => Self::padded_1d::<T, W>(
                 geo,
                 input,
@@ -326,6 +362,7 @@ impl Patcher {
             Patcher::Padded2d => Self::padded_2d::<T, W>(
                 geo,
                 input,
+                rows,
                 g,
                 pad_value.unwrap_or(&Tensor::zero_scalar::<T>()?),
                 writer,
@@ -472,6 +509,7 @@ impl Patcher {
     fn padded_2d<T: Copy + Datum, W: PackingWriter<T>>(
         geometry: &ConcreteGeometry,
         input: &TensorView,
+        rows: Range<usize>,
         g: usize,
         pad_value: &Tensor,
         writer: &mut W,
@@ -505,7 +543,7 @@ impl Patcher {
                     let iptr = iptr.offset(
                         *geometry.pool.patch.standard_layout_data_field.get_unchecked(kitem),
                     );
-                    for yo in 0..*geometry.pool.patch.output_shape.get_unchecked(0) {
+                    for yo in rows.clone() {
                         let y = yo as isize * y_stride + dy;
                         let iptr = iptr.offset(yo as isize * y_stride_ptr);
                         if y >= 0 && y < input_heigth {
@@ -574,6 +612,7 @@ impl Patcher {
     fn valid_2d<T: Copy + Datum, W: PackingWriter<T>>(
         geometry: &ConcreteGeometry,
         input: &TensorView,
+        rows: Range<usize>,
         g: usize,
         writer: &mut W,
     ) -> TractResult<()> {
@@ -586,7 +625,6 @@ impl Patcher {
             let c_stride_ptr = *shape.c_stride() as isize;
             let iptr = input.as_ptr_unchecked::<T>();
             let iptr = iptr.add(g * geometry.ci_per_group * shape.c_stride());
-            let output_y = *geometry.pool.patch.output_shape.get_unchecked(0);
             let output_x = *geometry.pool.patch.output_shape.get_unchecked(1);
             // Fast path: stride-1 contiguous reads along x within each y-row.
             // Each y-row becomes a single write_slice (memcpy when the slice
@@ -596,8 +634,8 @@ impl Patcher {
                 let iptr = iptr.offset(ci as isize * c_stride_ptr);
                 for koffset in &geometry.pool.patch.standard_layout_data_field {
                     let iptr = iptr.offset(*koffset);
-                    let mut iptr_y = iptr;
-                    for _ in 0..output_y {
+                    let mut iptr_y = iptr.offset(rows.start as isize * y_stride_ptr);
+                    for _ in rows.clone() {
                         if contiguous_x {
                             let row = std::slice::from_raw_parts(iptr_y, output_x);
                             writer.write_slice(row);
