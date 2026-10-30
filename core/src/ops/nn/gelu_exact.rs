@@ -17,29 +17,48 @@ fn round_to_f16(xs: &mut [f32], scratch: &mut [f16]) {
     scratch.convert_to_f32_slice(xs);
 }
 
+/// The f16 GELU of `xs`, rounding to f16 after each step as the unfused f16 chain does.
+fn gelu_f16_stepwise(xs: &mut [f16]) -> TractResult<()> {
+    let erf = Func::Erf.ew_f32()?;
+    let c = f16::from_f32(inv_sqrt2()).to_f32();
+    let mut wide = vec![0f32; xs.len().min(CHUNK)];
+    let mut scratch = vec![0f32; xs.len().min(CHUNK)];
+    let mut narrow = vec![f16::ZERO; xs.len().min(CHUNK)];
+    for chunk in xs.chunks_mut(CHUNK) {
+        let x = &mut wide[..chunk.len()];
+        let e = &mut scratch[..chunk.len()];
+        let narrow = &mut narrow[..chunk.len()];
+        chunk.convert_to_f32_slice(x);
+        e.iter_mut().zip(x.iter()).for_each(|(e, x)| *e = *x * c);
+        round_to_f16(e, narrow);
+        erf.run(e)?;
+        round_to_f16(e, narrow);
+        e.iter_mut().for_each(|e| *e += 1.0);
+        round_to_f16(e, narrow);
+        x.iter_mut().for_each(|x| *x *= 0.5);
+        round_to_f16(x, narrow);
+        x.iter_mut().zip(e.iter()).for_each(|(x, e)| *x *= *e);
+        chunk.convert_from_f32_slice(x);
+    }
+    Ok(())
+}
+
+/// [`gelu_f16_stepwise`] of every f16 bit pattern, indexed by the input's bits. 128 KiB,
+/// built on first use.
+fn gelu_f16_table() -> TractResult<&'static [u16]> {
+    static TABLE: std::sync::OnceLock<Box<[u16]>> = std::sync::OnceLock::new();
+    if let Some(table) = TABLE.get() {
+        return Ok(table);
+    }
+    let mut values: Vec<f16> = (0..=u16::MAX).map(f16::from_bits).collect();
+    gelu_f16_stepwise(&mut values)?;
+    Ok(TABLE.get_or_init(|| values.iter().map(|v| v.to_bits()).collect()))
+}
+
 crate::element_wise!(gelu_exact, GeluExact,
     [f16] => |_, xs| {
-        let erf = Func::Erf.ew_f32()?;
-        let c = f16::from_f32(inv_sqrt2()).to_f32();
-        let mut wide = vec![0f32; xs.len().min(CHUNK)];
-        let mut scratch = vec![0f32; xs.len().min(CHUNK)];
-        let mut narrow = vec![f16::ZERO; xs.len().min(CHUNK)];
-        for chunk in xs.chunks_mut(CHUNK) {
-            let x = &mut wide[..chunk.len()];
-            let e = &mut scratch[..chunk.len()];
-            let narrow = &mut narrow[..chunk.len()];
-            chunk.convert_to_f32_slice(x);
-            e.iter_mut().zip(x.iter()).for_each(|(e, x)| *e = *x * c);
-            round_to_f16(e, narrow);
-            erf.run(e)?;
-            round_to_f16(e, narrow);
-            e.iter_mut().for_each(|e| *e += 1.0);
-            round_to_f16(e, narrow);
-            x.iter_mut().for_each(|x| *x *= 0.5);
-            round_to_f16(x, narrow);
-            x.iter_mut().zip(e.iter()).for_each(|(x, e)| *x *= *e);
-            chunk.convert_from_f32_slice(x);
-        }
+        let table = gelu_f16_table()?;
+        xs.iter_mut().for_each(|x| *x = f16::from_bits(table[x.to_bits() as usize]));
         Ok(())
     },
     [f32] => |_, xs| {
@@ -206,6 +225,22 @@ mod tests {
                 );
             }
         }
+        Ok(())
+    }
+
+    #[test]
+    fn fused_f16_matches_the_chain_on_every_f16() -> TractResult<()> {
+        let all: Vec<f16> = (0..=u16::MAX).map(f16::from_bits).collect();
+        let len = all.len();
+        let raw = chain(DatumType::F16, len)?;
+        let input = || tensor1(&all).into_tvalue();
+        let reference = raw.clone().into_runnable()?.run(tvec!(input()))?;
+        let got = raw.into_decluttered()?.into_runnable()?.run(tvec!(input()))?;
+        let mismatch = (reference[0].try_as_plain_ram()?.as_slice::<f16>()?.iter())
+            .zip(got[0].try_as_plain_ram()?.as_slice::<f16>()?)
+            .zip(&all)
+            .find(|((r, g), _)| r.to_bits() != g.to_bits() && !(r.is_nan() && g.is_nan()));
+        assert_eq!(mismatch, None);
         Ok(())
     }
 }
