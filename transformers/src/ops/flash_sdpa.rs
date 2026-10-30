@@ -136,13 +136,27 @@ impl EvalOp for FlashSdpaOp {
         ensure!(num_kv_heads == v.shape()[1], "K/V head mismatch");
         ensure!(kv_len == v.shape()[2] && head_dim == v.shape()[3], "K/V shape mismatch");
 
-        let mut out =
-            self.flash_attention_gqa_impl(q, k, v, views.get(3).copied(), false)?.into_dyn();
-        if is_3d_case {
-            out.index_axis_inplace(tract_ndarray::Axis(1), 0);
-        }
-
-        Ok(tvec!(out.into_tensor().cast_to_dt(input_dt)?.into_owned().into_tvalue()))
+        let mask = views.get(3).copied();
+        let out = if input_dt == f16::datum_type() {
+            let mut out = Tensor::zero::<f16>(inputs[0].shape())?;
+            let mut plain = out.try_as_plain_ram_mut()?;
+            let slice = plain.as_slice_mut::<f16>()?;
+            self.attend_heads(q, k, v, mask, false, slice, |o, h| o.convert_from_f32_slice(h))?;
+            out
+        } else if input_dt == f32::datum_type() {
+            let mut out = Tensor::zero::<f32>(inputs[0].shape())?;
+            let mut plain = out.try_as_plain_ram_mut()?;
+            let slice = plain.as_slice_mut::<f32>()?;
+            self.attend_heads(q, k, v, mask, false, slice, |o, h| o.copy_from_slice(h))?;
+            out
+        } else {
+            let mut out = self.flash_attention_gqa_impl(q, k, v, mask, false)?.into_dyn();
+            if is_3d_case {
+                out.index_axis_inplace(tract_ndarray::Axis(1), 0);
+            }
+            out.into_tensor().cast_to_dt(input_dt)?.into_owned()
+        };
+        Ok(tvec!(out.into_tvalue()))
     }
 }
 
@@ -182,42 +196,58 @@ impl FlashSdpaOp {
         pv_strided: bool,
     ) -> TractResult<Array4<f32>> {
         let [batch_size, num_q_heads, q_len, head_dim] = q.shape();
+        let mut out = Array4::<f32>::zeros((batch_size, num_q_heads, q_len, head_dim));
+        let slice = out.as_slice_mut().context("fresh output is contiguous")?;
+        self.attend_heads(q, k, v, mask, pv_strided, slice, |o, h| o.copy_from_slice(h))?;
+        Ok(out)
+    }
+
+    /// Attends every (batch, q-head) pair, `store`-ing each head's f32 result into its
+    /// `[q_len, head_dim]` chunk of `out`, a contiguous `[batch, q_heads, q_len, head_dim]`
+    /// buffer, on the task that computed it.
+    #[allow(clippy::too_many_arguments)]
+    fn attend_heads<T: Send>(
+        &self,
+        q: FloatView,
+        k: FloatView,
+        v: FloatView,
+        mask: Option<FloatView>,
+        pv_strided: bool,
+        out: &mut [T],
+        store: impl Fn(&mut [T], &[f32]) + Sync,
+    ) -> TractResult<()> {
+        let [batch_size, num_q_heads, q_len, head_dim] = q.shape();
         let num_kv_heads = k.shape()[1];
         let group_size = num_q_heads / num_kv_heads;
-
-        let mut out = Array4::<f32>::zeros((batch_size, num_q_heads, q_len, head_dim));
+        let head_len = q_len * head_dim;
+        ensure!(out.len() == batch_size * num_q_heads * head_len);
+        if head_len == 0 {
+            return Ok(());
+        }
 
         // One independent task per (batch, q-head). Heads share only read-only Q/K/V
         // and write disjoint output slices, so this is embarrassingly parallel.
-        let tasks: Vec<(usize, usize)> =
-            (0..batch_size).flat_map(|b| (0..num_q_heads).map(move |qh| (b, qh))).collect();
         let exp = Func::Exp.ew_f32()?;
-        let compute = |&(b, qh): &(usize, usize)| {
+        let compute = |(task, out): (usize, &mut [T])| -> TractResult<()> {
+            let (b, qh) = (task / num_q_heads, task % num_q_heads);
             let kvh = qh / group_size;
             let (qs, ks, vs) = (q.head(b, qh), k.head(b, kvh), v.head(b, kvh));
             let mask = mask.as_ref().map(|m| m.head(b, qh));
             let mask = mask.as_ref().map(|m| m.view());
-            self.attend_one_head(qs.view(), ks.view(), vs.view(), mask, &*exp, pv_strided)
+            let head =
+                self.attend_one_head(qs.view(), ks.view(), vs.view(), mask, &*exp, pv_strided)?;
+            store(out, head.as_slice().context("fresh head output is contiguous")?);
+            Ok(())
         };
 
-        let results: Vec<Array2<f32>> = if Self::should_thread(tasks.len()) {
+        if Self::should_thread(batch_size * num_q_heads) {
             #[cfg(not(target_family = "wasm"))]
             {
                 use rayon::prelude::*;
-                tasks.par_iter().map(compute).collect::<TractResult<_>>()?
+                return out.par_chunks_mut(head_len).enumerate().try_for_each(compute);
             }
-            #[cfg(target_family = "wasm")]
-            {
-                tasks.iter().map(compute).collect::<TractResult<_>>()?
-            }
-        } else {
-            tasks.iter().map(compute).collect::<TractResult<_>>()?
-        };
-
-        for (&(b, qh), head_out) in tasks.iter().zip(results) {
-            out.slice_mut(s!(b, qh, .., ..)).assign(&head_out);
         }
-        Ok(out)
+        out.chunks_mut(head_len).enumerate().try_for_each(compute)
     }
 
     /// Whether to spread the per-head tasks across cores (rayon's global pool).
