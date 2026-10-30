@@ -15,7 +15,8 @@ tract_core::declare_knob!(
 );
 
 /// Longest K/V sequence attended as a single tile, its softmax taken in one pass
-/// rather than rescaled block by block.
+/// rather than rescaled block by block. Queries against such a K/V go in blocks
+/// of up to this many rows.
 const ONE_TILE_MAX_KV_LEN: usize = 256;
 
 /// Tract operator wrapper.
@@ -242,8 +243,9 @@ impl FlashSdpaOp {
         let kv_len = k.dim().0;
         let scale = self.scale.unwrap_or((head_dim as f32).recip().sqrt());
 
-        let block_kv_len = if kv_len <= ONE_TILE_MAX_KV_LEN { kv_len.max(1) } else { 32 };
-        let block_q_len = 32;
+        let one_tile = kv_len <= ONE_TILE_MAX_KV_LEN;
+        let block_kv_len = if one_tile { kv_len.max(1) } else { 32 };
+        let block_q_len = if one_tile { q_len.clamp(1, ONE_TILE_MAX_KV_LEN) } else { 32 };
 
         let mut out = Array2::<f32>::zeros((q_len, head_dim));
         let mut l = vec![0f32; q_len];
