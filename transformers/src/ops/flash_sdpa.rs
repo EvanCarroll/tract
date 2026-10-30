@@ -1,6 +1,8 @@
 use tract_nnef::internal::*;
 use tract_nnef::prelude::tract_itertools::Itertools;
 use tract_nnef::tract_core::tract_data::half::slice::HalfFloatSliceExt;
+use tract_nnef::tract_core::tract_linalg::element_wise::ElementWise;
+use tract_nnef::tract_core::tract_linalg::routines::Func;
 use tract_nnef::tract_ndarray::{
     Array2, Array4, ArrayView2, ArrayView4, ArrayViewMut2, CowArray, Ix2, s,
 };
@@ -134,7 +136,7 @@ impl EvalOp for FlashSdpaOp {
         ensure!(kv_len == v.shape()[2] && head_dim == v.shape()[3], "K/V shape mismatch");
 
         let mut out =
-            self.flash_attention_gqa_impl(q, k, v, views.get(3).copied(), false).into_dyn();
+            self.flash_attention_gqa_impl(q, k, v, views.get(3).copied(), false)?.into_dyn();
         if is_3d_case {
             out.index_axis_inplace(tract_ndarray::Axis(1), 0);
         }
@@ -160,7 +162,7 @@ impl FlashSdpaOp {
         k: ArrayView4<f32>,
         v: ArrayView4<f32>,
         mask: Option<ArrayView4<f32>>,
-    ) -> Array4<f32> {
+    ) -> TractResult<Array4<f32>> {
         self.flash_attention_gqa_impl(
             FloatView::F32(q),
             FloatView::F32(k),
@@ -177,7 +179,7 @@ impl FlashSdpaOp {
         v: FloatView,
         mask: Option<FloatView>,
         pv_strided: bool,
-    ) -> Array4<f32> {
+    ) -> TractResult<Array4<f32>> {
         let [batch_size, num_q_heads, q_len, head_dim] = q.shape();
         let num_kv_heads = k.shape()[1];
         let group_size = num_q_heads / num_kv_heads;
@@ -188,32 +190,33 @@ impl FlashSdpaOp {
         // and write disjoint output slices, so this is embarrassingly parallel.
         let tasks: Vec<(usize, usize)> =
             (0..batch_size).flat_map(|b| (0..num_q_heads).map(move |qh| (b, qh))).collect();
+        let exp = Func::Exp.ew_f32()?;
         let compute = |&(b, qh): &(usize, usize)| {
             let kvh = qh / group_size;
             let (qs, ks, vs) = (q.head(b, qh), k.head(b, kvh), v.head(b, kvh));
             let mask = mask.as_ref().map(|m| m.head(b, qh));
             let mask = mask.as_ref().map(|m| m.view());
-            self.attend_one_head(qs.view(), ks.view(), vs.view(), mask, pv_strided)
+            self.attend_one_head(qs.view(), ks.view(), vs.view(), mask, &*exp, pv_strided)
         };
 
         let results: Vec<Array2<f32>> = if Self::should_thread(tasks.len()) {
             #[cfg(not(target_family = "wasm"))]
             {
                 use rayon::prelude::*;
-                tasks.par_iter().map(compute).collect()
+                tasks.par_iter().map(compute).collect::<TractResult<_>>()?
             }
             #[cfg(target_family = "wasm")]
             {
-                tasks.iter().map(compute).collect()
+                tasks.iter().map(compute).collect::<TractResult<_>>()?
             }
         } else {
-            tasks.iter().map(compute).collect()
+            tasks.iter().map(compute).collect::<TractResult<_>>()?
         };
 
         for (&(b, qh), head_out) in tasks.iter().zip(results) {
             out.slice_mut(s!(b, qh, .., ..)).assign(&head_out);
         }
-        out
+        Ok(out)
     }
 
     /// Whether to spread the per-head tasks across cores (rayon's global pool).
@@ -232,8 +235,9 @@ impl FlashSdpaOp {
         k: ArrayView2<f32>,
         v: ArrayView2<f32>,
         mask: Option<ArrayView2<f32>>,
+        exp: &dyn ElementWise<f32>,
         pv_strided: bool,
-    ) -> Array2<f32> {
+    ) -> TractResult<Array2<f32>> {
         let (q_len, head_dim) = q.dim();
         let kv_len = k.dim().0;
         let scale = self.scale.unwrap_or((head_dim as f32).recip().sqrt());
@@ -287,7 +291,7 @@ impl FlashSdpaOp {
                     }
                 }
                 // Sij <- exp(Sij * scale - max_of_row)
-                s.mapv_inplace(f32::exp);
+                exp.run(s.as_slice_mut().context("score tile is contiguous")?)?;
                 let tile_l = s.sum_axis(tract_ndarray::Axis(1)).insert_axis(tract_ndarray::Axis(1));
                 // m_new = max(maxes, row_maxs)
                 let m_new = (0..q_range.len()).map(|i| m[i].max(tile_m[i])).collect_vec();
@@ -321,7 +325,7 @@ impl FlashSdpaOp {
                 m.copy_from_slice(&m_new);
             }
         }
-        out
+        Ok(out)
     }
 }
 
@@ -402,7 +406,7 @@ mod tests {
         let k = Array4::from_shape_vec((b, h, sk, d), kv.clone())?;
         let v = Array4::from_shape_vec((b, h, sk, d), vv.clone())?;
         let op = FlashSdpaOp { causal: false, scale: None };
-        let got = op.flash_attention_gqa(q.view(), k.view(), v.view(), None);
+        let got = op.flash_attention_gqa(q.view(), k.view(), v.view(), None)?;
         let gv: Vec<f32> = got.iter().copied().collect();
         let mut want = vec![0f32; b * h * sq * d];
         for bh in 0..b * h {
@@ -531,25 +535,31 @@ mod tests {
             let op = FlashSdpaOp { causal, scale: None };
             let bench = |strided: bool| -> f64 {
                 for _ in 0..2 {
-                    std::hint::black_box(op.flash_attention_gqa_impl(
-                        FloatView::F32(q.view()),
-                        FloatView::F32(k.view()),
-                        FloatView::F32(v.view()),
-                        None,
-                        strided,
-                    ));
-                }
-                let mut best = f64::MAX;
-                for _ in 0..8 {
-                    let t = Instant::now();
-                    for _ in 0..3 {
-                        std::hint::black_box(op.flash_attention_gqa_impl(
+                    std::hint::black_box(
+                        op.flash_attention_gqa_impl(
                             FloatView::F32(q.view()),
                             FloatView::F32(k.view()),
                             FloatView::F32(v.view()),
                             None,
                             strided,
-                        ));
+                        )
+                        .unwrap(),
+                    );
+                }
+                let mut best = f64::MAX;
+                for _ in 0..8 {
+                    let t = Instant::now();
+                    for _ in 0..3 {
+                        std::hint::black_box(
+                            op.flash_attention_gqa_impl(
+                                FloatView::F32(q.view()),
+                                FloatView::F32(k.view()),
+                                FloatView::F32(v.view()),
+                                None,
+                                strided,
+                            )
+                            .unwrap(),
+                        );
                     }
                     best = best.min(t.elapsed().as_secs_f64() / 3.0);
                 }

@@ -336,7 +336,7 @@ impl OpState for QuantizedKvSdpaState {
         }
         // flash_attention_gqa handles GQA (hq >= kh, hq % kh == 0).
         let flash = FlashSdpaOp { causal: false, scale: self.scale };
-        let o = flash.flash_attention_gqa(qv, k_full.view(), v_full.view(), None);
+        let o = flash.flash_attention_gqa(qv, k_full.view(), v_full.view(), None)?;
         Ok(tvec!(o.into_tensor().cast_to_dt(input_dt)?.into_owned().into_tvalue()))
     }
 
