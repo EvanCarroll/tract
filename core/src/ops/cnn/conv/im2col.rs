@@ -169,14 +169,11 @@ impl EvalOp for Im2Col {
 
             let n_batches = *geometry.input_shape_with_n.n().unwrap_or(&1);
             let n_groups = self.group;
-            let mut values: TVec<Box<dyn MMMInputValue>> =
-                TVec::with_capacity(n_batches * n_groups);
-
-            for i in 0..n_batches {
-                let input = input.view_at_prefix(&[i])?;
-                for g in 0..n_groups {
-                    let n =
-                        if geometry.pool.output_shape.shape.contains(&0) { 0 } else { geometry.n };
+            let n = if geometry.pool.output_shape.shape.contains(&0) { 0 } else { geometry.n };
+            // Allocated here rather than by the packing threads, so the buffers come
+            // from (and return to) the calling thread's allocator arena.
+            let mut buffers = (0..n_batches * n_groups)
+                .map(|_| {
                     let mut data = Tensor::uninitialized_aligned_dt(
                         dt,
                         &[n.divceil(r) * single_panel_len],
@@ -187,17 +184,35 @@ impl EvalOp for Im2Col {
                     } else if n % r != 0 {
                         data.as_bytes_mut()[(n / r) * panel_bytes..].fill(0);
                     }
-                    if n > 0 {
-                        dispatch_copy_by_size!(Patcher::patch(dt)(
-                            &geometry.patcher,
-                            &geometry,
-                            &input,
-                            &mut data.view_mut(),
-                            g,
-                            pad_value
-                        ))?;
-                    }
-                    values.push(Box::new(EagerPackedInput {
+                    Ok(data)
+                })
+                .collect::<TractResult<Vec<Tensor>>>()?;
+            if n > 0 {
+                let work = buffers.len() * n * geometry.k;
+                tract_linalg::multithread::par_chunks_mut(
+                    &mut buffers,
+                    1,
+                    work,
+                    |first, chunk| {
+                        for (ix, data) in (first..).zip(chunk.iter_mut()) {
+                            let input = input.view_at_prefix(&[ix / n_groups])?;
+                            dispatch_copy_by_size!(Patcher::patch(dt)(
+                                &geometry.patcher,
+                                &geometry,
+                                &input,
+                                &mut data.view_mut(),
+                                ix % n_groups,
+                                pad_value
+                            ))?;
+                        }
+                        Ok(())
+                    },
+                )?;
+            }
+            let values = buffers
+                .into_iter()
+                .map(|data| {
+                    Ok(Box::new(EagerPackedInput {
                         fact: PackedExoticFact {
                             format: geometry.out_format.clone(),
                             k: geometry.k,
@@ -206,9 +221,9 @@ impl EvalOp for Im2Col {
                         packed: data.into_blob()?.into(),
                         panel_bytes: if n > 0 { panel_bytes } else { 0 },
                         mn: n,
-                    }));
-                }
-            }
+                    }) as Box<dyn MMMInputValue>)
+                })
+                .collect::<TractResult<TVec<_>>>()?;
 
             let output = PackedMatrixStorage::new_batched(&geometry.packed_shape, values)
                 .into_tensor(input.datum_type());
