@@ -182,6 +182,14 @@ impl LazyIm2colInput {
             let o6 = *n_byte_offsets.offset(n + 5);
             let o7 = *n_byte_offsets.offset(n + 6);
             let o8 = *n_byte_offsets.offset(n + 7);
+            let size = T::datum_type().size_of() as isize;
+            if [o2, o3, o4, o5, o6, o7, o8].iter().zip(1..).all(|(o, i)| o - o1 == i * size) {
+                for k in k_range.start..k_range.end {
+                    let src = ptr.offset(*k_byte_offsets.offset(k) + o1) as *const T;
+                    writer.write_slice(std::slice::from_raw_parts(src, 8));
+                }
+                return;
+            }
             for k in k_range.start..k_range.end {
                 let ptr = ptr.offset(*k_byte_offsets.offset(k));
                 let v1 = *(ptr.offset(o1) as *const T);
