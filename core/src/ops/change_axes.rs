@@ -444,7 +444,10 @@ impl AxisOp {
                     self.change_shape_array(&mut shape, false)?;
                     return tensor.set_shape(&shape);
                 }
-                *tensor = tensor.moved_axis(*from, *to)?;
+                let elems = tensor.len();
+                *tensor = tensor.moved_axis_in_rows(*from, *to, |dst, row, fill| {
+                    tract_linalg::multithread::par_chunks_mut(dst, row, elems, fill)
+                })?;
                 Ok(())
             }
             Reshape(at, from, to) => {

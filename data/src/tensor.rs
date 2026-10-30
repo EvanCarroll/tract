@@ -303,17 +303,18 @@ fn transpose_tile(
     }
 }
 
-/// Transpose a `[a, mid]` matrix of `item`-byte cells into a `[mid, a]` matrix,
-/// visiting both in cache-sized tiles. `src` holds `a * mid` cells and `dst`
-/// `mid * a` cells, both densely packed.
-fn transpose_cells(src: &[u8], dst: &mut [u8], a: usize, mid: usize, item: usize) {
+/// Transpose the first `m_len` columns of a `[a, mid]` matrix of `item`-byte
+/// cells into a `[m_len, a]` matrix, visiting both in cache-sized tiles. `src`
+/// starts at the first of those columns and its rows are `mid` cells apart;
+/// `dst` holds `m_len * a` densely packed cells.
+fn transpose_cells(src: &[u8], dst: &mut [u8], a: usize, mid: usize, m_len: usize, item: usize) {
     let tile = (64 / item).max(16);
     let mut i0 = 0;
     while i0 < a {
         let i1 = (i0 + tile).min(a);
         let mut m0 = 0;
-        while m0 < mid {
-            let m1 = (m0 + tile).min(mid);
+        while m0 < m_len {
+            let m1 = (m0 + tile).min(m_len);
             transpose_tile(src, dst, i0, i1, m0, m1, a, mid, item);
             m0 += tile;
         }
@@ -358,9 +359,53 @@ fn move_axis_blocks(
                 &mut dst[o * p * q * item..(o + 1) * p * q * item],
                 p,
                 q,
+                q,
                 item,
             );
         }
+    }
+}
+
+/// Fill `dst` with whole rows of the `[outer, q, p, inner]` relayout
+/// [`move_axis_blocks`] makes of `src`, starting at row `first_row`. A row is one
+/// `(outer, q)` position, `p * inner * elem_size` bytes long, so `dst` must hold
+/// a whole number of rows; the rows of a split may be filled in any order.
+#[allow(clippy::too_many_arguments)]
+fn move_axis_rows(
+    src: &[u8],
+    dst: &mut [u8],
+    first_row: usize,
+    p: usize,
+    q: usize,
+    inner: usize,
+    elem_size: usize,
+) {
+    let item = inner * elem_size;
+    let row = p * item;
+    if first_row == 0 && dst.len() == src.len() {
+        return move_axis_blocks(src, dst, src.len() / (row * q), p, q, inner, elem_size);
+    }
+    let end = first_row + dst.len() / row;
+    let mut r = first_row;
+    while r < end {
+        let (o, m0) = (r / q, r % q);
+        let rows = (q - m0).min(end - r);
+        let src = &src[(o * p * q + m0) * item..(o + 1) * p * q * item];
+        let dst = &mut dst[(r - first_row) * row..(r - first_row + rows) * row];
+        if p == 1 || q == 1 {
+            dst.copy_from_slice(&src[..dst.len()]);
+        } else if item >= 64 {
+            for m in 0..rows {
+                for i in 0..p {
+                    let s = (i * q + m) * item;
+                    let d = (m * p + i) * item;
+                    dst[d..d + item].copy_from_slice(&src[s..s + item]);
+                }
+            }
+        } else {
+            transpose_cells(src, dst, p, q, rows, item);
+        }
+        r += rows;
     }
 }
 
@@ -941,6 +986,26 @@ impl Tensor {
     /// plain storage. Data is copied once. Falls back to a clone plus the
     /// ndarray path when the tensor is not plainly and contiguously laid out.
     pub fn moved_axis(&self, from: usize, to: usize) -> TractResult<Tensor> {
+        self.moved_axis_in_rows(from, to, |dst, _, fill| fill(0, dst))
+    }
+
+    /// [`Tensor::moved_axis`], with the copy split by the caller, e.g. across
+    /// threads. `split` gets the output's bytes, the byte length of one output
+    /// row, and `fill`, which writes any run of whole rows given the index of its
+    /// first row. `split` must cover the output with disjoint runs, in any order
+    /// and on any threads; the result is the same as `moved_axis`'s. It is not
+    /// called on the fallback path, nor when the output is empty.
+    #[allow(clippy::type_complexity)]
+    pub fn moved_axis_in_rows(
+        &self,
+        from: usize,
+        to: usize,
+        split: impl FnOnce(
+            &mut [u8],
+            usize,
+            &(dyn Fn(usize, &mut [u8]) -> TractResult<()> + Sync),
+        ) -> TractResult<()>,
+    ) -> TractResult<Tensor> {
         ensure!(from < self.rank());
         ensure!(to < self.rank());
         let mut new_shape: TVec<usize> = self.shape.clone();
@@ -953,31 +1018,22 @@ impl Tensor {
             return self.clone().permute_axes(&permutation);
         }
         let shape = &*self.shape;
-        let (outer, p, q, inner) = if from < to {
-            (
-                shape[..from].iter().product(),
-                shape[from],
-                shape[from + 1..=to].iter().product(),
-                shape[to + 1..].iter().product(),
-            )
+        let (p, q, inner): (usize, usize, usize) = if from < to {
+            (shape[from], shape[from + 1..=to].iter().product(), shape[to + 1..].iter().product())
         } else {
-            (
-                shape[..to].iter().product(),
-                shape[to..from].iter().product(),
-                shape[from],
-                shape[from + 1..].iter().product(),
-            )
+            (shape[to..from].iter().product(), shape[from], shape[from + 1..].iter().product())
         };
         let mut output = Tensor::zero_dt(self.dt, &new_shape)?;
-        move_axis_blocks(
-            self.as_bytes(),
-            output.as_bytes_mut(),
-            outer,
-            p,
-            q,
-            inner,
-            self.dt.size_of(),
-        );
+        let elem_size = self.dt.size_of();
+        let row = p * inner * elem_size;
+        if row == 0 || output.len() == 0 {
+            return Ok(output);
+        }
+        let src = self.as_bytes();
+        split(output.as_bytes_mut(), row, &|first_row, dst| {
+            move_axis_rows(src, dst, first_row, p, q, inner, elem_size);
+            Ok(())
+        })?;
         Ok(output)
     }
 
@@ -2762,6 +2818,31 @@ mod tests {
                     check_moved_axis::<f16>(&shape, from, to);
                     check_moved_axis::<f32>(&shape, from, to);
                     check_moved_axis::<f64>(&shape, from, to);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn moved_axis_in_rows_matches_moved_axis_for_any_split() {
+        for shape in [vec![5usize, 7, 3], vec![2, 70, 33], vec![3, 1024, 7], vec![4, 9, 2, 40]] {
+            let len = shape.iter().product::<usize>();
+            let t = Tensor::from_shape(&shape, &(0..len as u32).collect::<Vec<_>>()).unwrap();
+            for from in 0..shape.len() {
+                for to in 0..shape.len() {
+                    let want = t.moved_axis(from, to).unwrap();
+                    for rows_per_run in [1, 2, 5, 64] {
+                        let got = t
+                            .moved_axis_in_rows(from, to, |dst, row, fill| {
+                                let runs: Vec<_> = dst.chunks_mut(row * rows_per_run).collect();
+                                for (ix, run) in runs.into_iter().enumerate().rev() {
+                                    fill(ix * rows_per_run, run)?;
+                                }
+                                Ok(())
+                            })
+                            .unwrap();
+                        assert_eq!(got, want, "{shape:?} {from}->{to} by {rows_per_run}");
+                    }
                 }
             }
         }
